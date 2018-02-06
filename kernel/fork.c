@@ -2258,6 +2258,8 @@ long _do_fork(unsigned long clone_flags,
 	      int __user *child_tidptr,
 	      unsigned long tls)
 {
+	struct completion vfork;
+	struct pid *pid;
 	struct task_struct *p;
 	int trace = 0;
 	long nr;
@@ -2280,49 +2282,46 @@ long _do_fork(unsigned long clone_flags,
 			trace = 0;
 	}
 
-	p = copy_process(clone_flags, stack_start, stack_size, parent_tidptr,
-			 child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
-	add_latent_entropy();
-	/*
-	 * Do this prior waking up the new thread - the thread pointer
-	 * might get invalid after that point, if the thread exits quickly.
-	 */
-	if (!IS_ERR(p)) {
-		struct completion vfork;
-		struct pid *pid;
+        p = copy_process(clone_flags, stack_start, stack_size, parent_tidptr,
+                         child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
+        add_latent_entropy();
 
-		cpufreq_task_times_alloc(p);
+        if (IS_ERR(p))
+                return PTR_ERR(p);
 
-		trace_sched_process_fork(current, p);
+        /*
+         * Do this prior waking up the new thread - the thread pointer
+         * might get invalid after that point, if the thread exits quickly.
+         */
+        trace_sched_process_fork(current, p);
 
-		pid = get_task_pid(p, PIDTYPE_PID);
-		nr = pid_vnr(pid);
+        cpufreq_task_times_alloc(p);
 
-		if (clone_flags & CLONE_PARENT_SETTID)
-			put_user(nr, parent_tidptr);
+        pid = get_task_pid(p, PIDTYPE_PID);
+        nr = pid_vnr(pid);
 
-		if (clone_flags & CLONE_VFORK) {
-			p->vfork_done = &vfork;
-			init_completion(&vfork);
-			get_task_struct(p);
-		}
+        if (clone_flags & CLONE_PARENT_SETTID)
+                put_user(nr, parent_tidptr);
 
-		wake_up_new_task(p);
+        if (clone_flags & CLONE_VFORK) {
+                p->vfork_done = &vfork;
+                init_completion(&vfork);
+                get_task_struct(p);
+        }
 
-		/* forking complete and child started to run, tell ptracer */
-		if (unlikely(trace))
-			ptrace_event_pid(trace, pid);
+        wake_up_new_task(p);
 
-		if (clone_flags & CLONE_VFORK) {
-			if (!wait_for_vfork_done(p, &vfork))
-				ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
-		}
+        /* forking complete and child started to run, tell ptracer */
+        if (unlikely(trace))
+                ptrace_event_pid(trace, pid);
 
-		put_pid(pid);
-	} else {
-		nr = PTR_ERR(p);
-	}
-	return nr;
+        if (clone_flags & CLONE_VFORK) {
+                if (!wait_for_vfork_done(p, &vfork))
+                        ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
+        }
+
+        put_pid(pid);
+        return nr;
 }
 
 #ifndef CONFIG_HAVE_COPY_THREAD_TLS

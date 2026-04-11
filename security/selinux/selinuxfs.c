@@ -546,7 +546,7 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 	if (count > 64 * 1024 * 1024)
 		return -EFBIG;
 
-	mutex_lock(&sel_mutex);
+	mutex_lock(&fsi->mutex);
 
 	length = avc_has_perm(&selinux_state,
 			      current_sid(), SECINITSID_SECURITY,

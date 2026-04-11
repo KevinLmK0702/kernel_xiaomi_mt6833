@@ -74,11 +74,6 @@ TRACE_EVENT(sched_kthread_stop_ret,
 	TP_printk("ret=%d", __entry->ret)
 );
 
-#ifdef CREATE_TRACE_POINTS
-static inline long __trace_sched_switch_state(bool preempt,
-						struct task_struct *p);
-#endif
-
 /**
  * sched_kthread_work_queue_work - called when a work gets queued
  * @worker:	pointer to the kthread_worker

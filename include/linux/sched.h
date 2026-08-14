@@ -1991,12 +1991,6 @@ extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 
 void __exit_umh(struct task_struct *tsk);
 
-static inline void exit_umh(struct task_struct *tsk)
-{
-	if (unlikely(tsk->flags & PF_UMH))
-		__exit_umh(tsk);
-}
-
 #include <linux/sched/sched.h>
 #endif
 

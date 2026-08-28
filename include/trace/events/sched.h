@@ -327,15 +327,15 @@ TRACE_EVENT(sched_switch,
 		__entry->next_prio	= next->prio;
 #if defined(CONFIG_MTK_SCHED_TRACERS) && defined(CONFIG_CGROUPS)
 #if defined(CONFIG_CPUSETS)
-		__entry->prev_cgrp_id	= prev->cgroups->subsys[0]->cgroup->id;
-		__entry->next_cgrp_id	= next->cgroups->subsys[0]->cgroup->id;
+		__entry->prev_cgrp_id	= cgroup_id(prev->cgroups->subsys[0]->cgroup);
+		__entry->next_cgrp_id	= cgroup_id(next->cgroups->subsys[0]->cgroup);
 #else
 		__entry->prev_cgrp_id	= 0;
 		__entry->next_cgrp_id	= 0;
 #endif
 #if defined(CONFIG_SCHED_TUNE)
-		__entry->prev_st_cgrp_id = prev->cgroups->subsys[3]->cgroup->id;
-		__entry->next_st_cgrp_id = next->cgroups->subsys[3]->cgroup->id;
+		__entry->prev_st_cgrp_id = cgroup_id(prev->cgroups->subsys[3]->cgroup);
+		__entry->next_st_cgrp_id = cgroup_id(next->cgroups->subsys[3]->cgroup);
 #else
 		__entry->prev_st_cgrp_id = 0;
 		__entry->next_st_cgrp_id = 0;

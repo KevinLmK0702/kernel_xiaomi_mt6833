@@ -53,6 +53,9 @@
 
 #ifdef CONFIG_MTK_SCHED_TRACERS
 #include "mtk_ftrace.h"
+#define CREATE_TRACE_POINTS
+#include <trace/events/mtk_events.h>
+EXPORT_TRACEPOINT_SYMBOL(gpu_freq);
 #endif
 /*
  * On boot up, the ring buffer is set to the minimum size, so that

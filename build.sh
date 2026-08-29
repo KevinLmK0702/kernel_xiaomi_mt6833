@@ -25,6 +25,10 @@ print_info "设置编译环境..."
 TC_DIR="$HOME/toolchains"
 CLANG_DIR="$TC_DIR/Clang-22.0/bin/"
 CLANG_LIB="$TC_DIR/Clang-22.0/lib/"
+
+DATE_STR=$(date +'%y%m%d')
+KER_STR="Evergo and Everpal Kernel, compiled on $DATE_STR"
+
 export PATH="$CLANG_DIR:$PATH"
 export LD_LIBRARY_PATH="$CLANG_LIB":$LD_LIBRARY_PATH
 export ARCH=arm64
@@ -77,12 +81,12 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     sed -i 's/device\.name2=.*/device.name2=everpal/' anykernel.sh
     sed -i '/device\.name[3-5]=.*/d' anykernel.sh
 
-    sed -i "s/kernel\.string=.*/kernel.string=Evergo and Everpal Kernel by 酷安@孤独不能 and KevinLmK_/" anykernel.sh
+    sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
 
     sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
     sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
 
-    zip -r ../AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20.zip *
+    zip -r ../AnyKernel3-evergo-mainline.zip *
 
     cd ..  
     print_info "内核打包完成, 文件输出: "

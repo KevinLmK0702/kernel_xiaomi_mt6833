@@ -13,7 +13,8 @@ FLGS="--target=aarch64-linux-gnu \
       -Wno-unused-variable \
       -Wno-unused-function \
       -Wno-unused-label \
-      -Wno-incompatible-pointer-types"
+      -Wno-incompatible-pointer-types \
+      -Wno-default-const-init-var-unsafe"
 
 print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
@@ -22,9 +23,10 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 print_info "设置编译环境..."
 
 TC_DIR="$HOME/toolchains"
-CLANG_DIR="$TC_DIR/Clang-16.0.6/bin"
-
+CLANG_DIR="$TC_DIR/Clang-22.0/bin/"
+CLANG_LIB="$TC_DIR/Clang-22.0/lib/"
 export PATH="$CLANG_DIR:$PATH"
+export LD_LIBRARY_PATH="$CLANG_LIB":$LD_LIBRARY_PATH
 export ARCH=arm64
 export SUBARCH=arm
 export CLANG_TRIPLE=aarch64-linux-gnu-

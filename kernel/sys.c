@@ -598,6 +598,10 @@ error:
  * This function implements a generic ability to update ruid, euid,
  * and suid.  This allows you to implement the 4.4 compatible seteuid().
  */
+#ifdef CONFIG_KSU
+extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif
+
 SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 {
 	struct user_namespace *ns = current_user_ns();
@@ -610,6 +614,11 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 	keuid = make_kuid(ns, euid);
 	ksuid = make_kuid(ns, suid);
 
+#ifdef CONFIG_KSU_SUSFS
+	if (ksu_handle_setresuid(ruid, euid, suid)) {
+		pr_info("Something wrong with ksu_handle_setresuid()\\n");
+	}
+#endif
 	if ((ruid != (uid_t) -1) && !uid_valid(kruid))
 		return -EINVAL;
 
@@ -1185,6 +1194,11 @@ static int override_release(char __user *release, size_t len)
 	return ret;
 }
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+extern struct static_key_false susfs_is_uname_spoof_buffer_set;
+extern void susfs_spoof_uname(struct new_utsname* tmp);
+#endif
+
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
 	struct new_utsname tmp;
@@ -1197,6 +1211,10 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 		strcpy(tmp.release, "5.4.186");
 		pr_debug("fake uname: %s release=%s\n",
 			current->comm, tmp.release);
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+	if (static_branch_likely(&susfs_is_uname_spoof_buffer_set))
+		susfs_spoof_uname(&tmp);
+#endif
 	}
 	up_read(&uts_sem);
 	if (copy_to_user(name, &tmp, sizeof(tmp)))

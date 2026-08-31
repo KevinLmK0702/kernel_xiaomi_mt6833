@@ -71,10 +71,11 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     print_info "内核编译成功!"
     ls -lh "out/arch/arm64/boot/Image.gz"
     file "out/arch/arm64/boot/Image.gz"
+    rm -rf AnyKernel3
 
     git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
     cp out/arch/arm64/boot/Image AnyKernel3/
-    rm -rf AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20.zip
+    rm -rf AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20-*.zip
     cd AnyKernel3
 
     sed -i 's/device\.name1=.*/device.name1=evergo/' anykernel.sh
@@ -86,7 +87,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
     sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
 
-    zip -r ../AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20.zip *
+    zip -r ../AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20-$DATE_STR.zip *
 
     cd ..  
     print_info "内核打包完成, 文件输出: "

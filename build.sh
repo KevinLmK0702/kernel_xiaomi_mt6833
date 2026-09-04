@@ -13,8 +13,7 @@ FLGS="--target=aarch64-linux-gnu \
       -Wno-unused-variable \
       -Wno-unused-function \
       -Wno-unused-label \
-      -Wno-incompatible-pointer-types \
-      -Wno-default-const-init-var-unsafe"
+      -Wno-incompatible-pointer-types"
 
 print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
@@ -23,8 +22,8 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 print_info "设置编译环境..."
 
 TC_DIR="$HOME/toolchains"
-CLANG_DIR="$TC_DIR/Clang-22.0/bin/"
-CLANG_LIB="$TC_DIR/Clang-22.0/lib/"
+CLANG_DIR="$TC_DIR/Clang-16.0/bin/"
+CLANG_LIB="$TC_DIR/Clang-16.0/lib/"
 
 DATE_STR=$(date +'%y%m%d')
 KER_STR="Evergo and Everpal Kernel, compiled on $DATE_STR"

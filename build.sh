@@ -70,6 +70,14 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     print_info "内核编译成功!"
     ls -lh "out/arch/arm64/boot/Image.gz"
     file "out/arch/arm64/boot/Image.gz"
+
+    wget -O kpimg https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.13/kpimg-linux
+    wget -O kptools https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.13/kptools-linux
+    chmod 777 kpimg kptools
+    cp out/arch/arm64/boot/Image Image.old
+    ./kptools -p -i Image.old -k kpimg -o Image
+    cp -f Image out/arch/arm64/boot/Image
+
     rm -rf AnyKernel3
 
     git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3

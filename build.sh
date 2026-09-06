@@ -94,7 +94,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
     sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
 
-    zip -r ../AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.20-$DATE_STR.zip *
+    zip -r ../AnyKernel3-evergo-ReSukiSU-4.20-SUSFS-2.3.0-$DATE_STR.zip *
 
     cd ..  
     print_info "内核打包完成, 文件输出: "

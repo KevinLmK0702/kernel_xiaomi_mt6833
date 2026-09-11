@@ -74,7 +74,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
     cp out/arch/arm64/boot/Image AnyKernel3/
-    rm -rf AnyKernel3-evergo-mainline-*.zip
+    rm -rf AnyKernel3-evergo-ReSukiSU-4.2.0-*.zip
     cd AnyKernel3
 
     sed -i 's/device\.name1=.*/device.name1=evergo/' anykernel.sh
@@ -86,7 +86,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
     sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
 
-    zip -r ../AnyKernel3-evergo-mainline-$DATE_STR.zip *
+    zip -r ../AnyKernel3-evergo-ReSukiSU-4.2.0-$DATE_STR.zip *
 
     cd ..  
     print_info "内核打包完成, 文件输出: "

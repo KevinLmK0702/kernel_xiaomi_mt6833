@@ -35,6 +35,19 @@ void walt_account_irqtime(int cpu, struct task_struct *curr, u64 delta,
 u64 walt_irqload(int cpu);
 int walt_cpu_high_irqload(int cpu);
 
+/*
+ * WALT load info consumed by the cpufreq governor(s), ported from
+ * Qualcomm's kernel/sched/walt (walt_cpu_load / cpu_util_freq_walt).
+ */
+struct walt_cpu_load {
+	unsigned long nl;
+	unsigned long pl;
+	bool rtgb_active;
+	u64 ws;
+};
+
+unsigned long cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load);
+
 #else /* CONFIG_SCHED_WALT */
 
 static inline void walt_update_task_ravg(struct task_struct *p, struct rq *rq,

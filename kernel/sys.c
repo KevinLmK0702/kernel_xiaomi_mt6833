@@ -1198,7 +1198,6 @@ static int override_release(char __user *release, size_t len)
 extern struct static_key_false susfs_is_uname_spoof_buffer_set;
 extern void susfs_spoof_uname(struct new_utsname* tmp);
 #endif
-
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
 	struct new_utsname tmp;
@@ -1212,6 +1211,7 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 		pr_debug("fake uname: %s release=%s\n",
 			current->comm, tmp.release);
 	} else {
+		// try to make SUSFS Spoof UNAME worked when spoofing bpfloader, netbpfload, and netd processes 
 #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 		if (static_branch_likely(&susfs_is_uname_spoof_buffer_set))
 			susfs_spoof_uname(&tmp);

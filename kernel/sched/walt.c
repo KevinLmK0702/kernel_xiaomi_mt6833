@@ -124,6 +124,48 @@ u64 walt_ktime_clock(void)
 	return ktime_get_ns();
 }
 
+/*
+ * WALT based CPU utilization for the "walt" cpufreq governor. Mirrors
+ * cpu_util_freq() in fair.c but additionally reports the WALT load info
+ * the Qualcomm walt governor consumes (nl/pl/rtgb_active/ws).
+ *
+ * nl (new task load) and rtgb_active (related thread group boost) do not
+ * exist in this WALT implementation and are always 0/false; pl is
+ * approximated with the accumulated load of the current window.
+ */
+unsigned long cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load)
+{
+	struct rq *rq = cpu_rq(cpu);
+	u64 util;
+
+	if (walt_load) {
+		walt_load->nl = 0;
+		walt_load->pl = 0;
+		walt_load->rtgb_active = false;
+		walt_load->ws = 0;
+	}
+
+	if (likely(!walt_disabled && sysctl_sched_use_walt_cpu_util)) {
+		util = rq->prev_runnable_sum;
+		util <<= SCHED_CAPACITY_SHIFT;
+		do_div(util, walt_ravg_window);
+
+		if (walt_load) {
+			u64 pl = rq->cumulative_runnable_avg;
+
+			pl <<= SCHED_CAPACITY_SHIFT;
+			do_div(pl, walt_ravg_window);
+			walt_load->pl = (unsigned long)pl;
+			walt_load->ws = rq->window_start;
+		}
+	} else {
+		util = READ_ONCE(rq->cfs.avg.util_avg);
+		util += READ_ONCE(rq->rt.avg.util_avg);
+	}
+
+	return min_t(unsigned long, util, capacity_orig_of(cpu));
+}
+
 static void walt_resume(void)
 {
 	walt_ktime_suspended = false;

@@ -232,6 +232,21 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_WALT
+	bool "'walt' cpufreq policy governor (Qualcomm WALT port)"
+	depends on CPU_FREQ && SMP && SCHED_WALT && CPU_FREQ_GOV_SCHEDUTIL
+	select CPU_FREQ_GOV_ATTR_SET
+	select IRQ_WORK
+	help
+	  Port of Qualcomm's WALT cpufreq governor (cpufreq_walt.c) on top of
+	  this kernel's schedutil framework. It drives the CPU frequency from
+	  the WALT (window assisted load tracking) signals and exposes the
+	  waltgov tunables (hispeed_load, hispeed_freq, adaptive_low_freq,
+	  adaptive_high_freq, target_load_thresh, target_load_shift, pl and
+	  boost) via sysfs, like the original governor does.
+
+	  If in doubt, say N.
+
 comment "CPU frequency scaling drivers"
 
 config CPUFREQ_DT

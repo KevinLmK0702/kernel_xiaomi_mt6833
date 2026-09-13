@@ -35,6 +35,9 @@
 #include "walt.h"
 #include "cpufreq_schedutil.h"
 
+#define CREATE_TRACE_POINTS
+#include "walt_trace.h"
+
 static struct cpufreq_governor walt_gov;
 unsigned long boosted_cpu_util(int cpu);
 
@@ -78,6 +81,20 @@ struct sugov_policy {
 	u64 curr_cycles;
 	u64 last_cyc_update_time;
 	unsigned long avg_cap;
+
+	/* Last decision, exposed through the read-only walt/decision node */
+	u64 last_time;
+	u64 update_count;
+	u64 hispeed_hits;
+	u64 pl_hits;
+	unsigned long last_util;
+	unsigned long last_max;
+	unsigned long last_avg_cap;
+	unsigned long last_pl;
+	unsigned int last_raw_freq;
+	unsigned int last_freq;
+	unsigned int last_cpu;
+	unsigned int last_flags;
 
 	/* The next fields are only needed if fast switch cannot be used. */
 	struct irq_work irq_work;
@@ -359,12 +376,49 @@ static void walt_adjust_util(struct sugov_cpu *sg_cpu, unsigned long cpu_util,
 	is_hiload = (cpu_util >= mult_frac(sg_policy->avg_cap,
 					   tunables->hispeed_load, 100));
 
-	if (is_hiload && tunables->hispeed_freq)
-		*util = max(*util, walt_target_util(sg_policy,
-						    tunables->hispeed_freq));
+	if (is_hiload && tunables->hispeed_freq) {
+		unsigned long hs = walt_target_util(sg_policy,
+						    tunables->hispeed_freq);
 
-	if (tunables->pl && sg_cpu->walt_load.pl)
+		if (hs > *util)
+			sg_policy->hispeed_hits++;
+		*util = max(*util, hs);
+	}
+
+	if (tunables->pl && sg_cpu->walt_load.pl) {
+		if (sg_cpu->walt_load.pl > *util)
+			sg_policy->pl_hits++;
 		*util = max(*util, sg_cpu->walt_load.pl);
+	}
+}
+
+/*
+ * Save the last decision and emit it through the tracepoint, so that the
+ * governor can be tuned from data instead of guesses.
+ */
+static void waltgov_trace_decision(struct sugov_policy *sg_policy, int cpu,
+				   unsigned long util, unsigned long max,
+				   unsigned int freq, unsigned int flags)
+{
+	struct sugov_tunables *tunables = sg_policy->tunables;
+	unsigned long pl = per_cpu(sugov_cpu, cpu).walt_load.pl;
+	bool hiload = (util >= mult_frac(sg_policy->avg_cap,
+					 tunables->hispeed_load, 100));
+
+	sg_policy->last_time = walt_ktime_clock();
+	sg_policy->last_cpu = cpu;
+	sg_policy->last_util = util;
+	sg_policy->last_max = max;
+	sg_policy->last_avg_cap = sg_policy->avg_cap;
+	sg_policy->last_pl = pl;
+	sg_policy->last_raw_freq = sg_policy->cached_raw_freq;
+	sg_policy->last_freq = freq;
+	sg_policy->last_flags = flags;
+	sg_policy->update_count++;
+
+	trace_waltgov_next_freq(cpu, util, max, sg_policy->cached_raw_freq,
+				freq, sg_policy->avg_cap, pl, hiload,
+				tunables->boost, flags);
 }
 
 /*
@@ -562,6 +616,8 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 		cid = arch_get_cluster_id(sg_policy->policy->cpu);
 		next_f = mt_cpufreq_find_close_freq(cid, next_f);
 #endif
+		waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max,
+				       next_f, flags);
 		/*
 		 * Do not reduce the frequency if the CPU has not been idle
 		 * recently, as the reduction is likely to be premature then.
@@ -632,6 +688,8 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	cid = arch_get_cluster_id(sg_policy->policy->cpu);
 	next_f = mt_cpufreq_find_close_freq(cid, next_f);
 #endif
+	waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max, next_f,
+			       sg_cpu->flags);
 	return next_f;
 }
 
@@ -947,6 +1005,33 @@ static struct governor_attr target_load_shift = __ATTR_RW(target_load_shift);
 static struct governor_attr pl = __ATTR_RW(pl);
 static struct governor_attr boost = __ATTR_RW(boost);
 
+static ssize_t decision_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	struct sugov_policy *sg_policy;
+	int len = 0;
+
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
+		len += sprintf(buf + len,
+			"policy%u cpu=%u util=%lu max=%lu avg_cap=%lu pl=%lu raw_freq=%u freq=%u flags=0x%x updates=%llu hispeed_hits=%llu pl_hits=%llu\n",
+				sg_policy->policy->cpu, sg_policy->last_cpu,
+				sg_policy->last_util, sg_policy->last_max,
+				sg_policy->last_avg_cap, sg_policy->last_pl,
+				sg_policy->last_raw_freq, sg_policy->last_freq,
+				sg_policy->last_flags,
+				(unsigned long long)sg_policy->update_count,
+				(unsigned long long)sg_policy->hispeed_hits,
+				(unsigned long long)sg_policy->pl_hits);
+	}
+
+	return len;
+}
+
+static struct governor_attr decision = {
+	.attr = { .name = "decision", .mode = 0444 },
+	.show = decision_show,
+};
+
 static struct attribute *sugov_attributes[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
@@ -958,6 +1043,7 @@ static struct attribute *sugov_attributes[] = {
 	&target_load_shift.attr,
 	&pl.attr,
 	&boost.attr,
+	&decision.attr,
 	NULL
 };
 

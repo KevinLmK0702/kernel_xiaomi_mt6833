@@ -22,6 +22,10 @@
 #include <linux/acpi.h>
 #include <linux/syscore_ops.h>
 #include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/pid.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
 #include <trace/events/sched.h>
 #include "sched.h"
 #include "walt.h"
@@ -71,11 +75,222 @@ static inline void fixup_cum_window_demand(struct rq *rq, s64 delta)
 		rq->cum_window_demand = 0;
 }
 
+/******************************************************************************
+ * Related thread groups (RTG), reduced port of Qualcomm's implementation
+ *
+ * Qualcomm's RTG couples cgroup colocation, per-cluster group load accounting
+ * (grp_time) and EAS preferred-cluster placement to the rtg_boost_freq of the
+ * walt governor. None of that infrastructure exists in this kernel, so only
+ * the part the governor actually consumes is provided:
+ *
+ *  - a group is a plain id, stored per task in p->ravg.grp_id,
+ *  - a group's load is the sum of the demand of its queued tasks,
+ *  - a group counts as "active" once its load exceeds half of what the least
+ *    capable CPU can contribute in one WALT window; the walt governor then
+ *    raises the utilization to rtg_boost_freq while the group runs.
+ *
+ * Group ids are assigned with sched_set_group_id() (same name and prototype
+ * as Qualcomm's API) and, for manual use, through the debugfs file
+ * /sys/kernel/debug/sched_rtg: "echo <pid> <group_id> > ...", group_id 0
+ * removes the task from its group. Children inherit the group of their
+ * parent.
+ *****************************************************************************/
+#define MAX_NUM_CGROUP_COLOC_ID	20
+#define RTG_BOOST_DEMAND_PCT	50
+
+struct walt_related_thread_group {
+	int		id;
+	atomic64_t	load;
+};
+
+static struct walt_related_thread_group
+		*related_thread_groups[MAX_NUM_CGROUP_COLOC_ID];
+static atomic64_t walt_rtg_total_load = ATOMIC64_INIT(0);
+
+static inline struct walt_related_thread_group *
+walt_lookup_group(unsigned int id)
+{
+	if (id == 0 || id >= MAX_NUM_CGROUP_COLOC_ID)
+		return NULL;
+
+	return related_thread_groups[id];
+}
+
+/* Account a change of @p's demand against its related thread group */
+static void walt_grp_load_add(struct task_struct *p, s64 delta)
+{
+	struct walt_related_thread_group *grp;
+
+	if (!delta)
+		return;
+
+	grp = walt_lookup_group(p->ravg.grp_id);
+	if (!grp)
+		return;
+
+	atomic64_add(delta, &grp->load);
+	atomic64_add(delta, &walt_rtg_total_load);
+}
+
+static bool walt_rtgb_active(void)
+{
+	struct walt_related_thread_group *grp;
+	u64 threshold;
+	int i;
+
+	/*
+	 * Demand of a fully busy least capable CPU, scaled by
+	 * RTG_BOOST_DEMAND_PCT: small enough that any real workload triggers
+	 * the boost, large enough that an idle group does not.
+	 */
+	threshold = mult_frac((u64)walt_ravg_window,
+			      capacity_orig_of(0) * RTG_BOOST_DEMAND_PCT,
+			      SCHED_CAPACITY_SCALE * 100);
+
+	if (atomic64_read(&walt_rtg_total_load) < (s64)threshold)
+		return false;
+
+	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
+		grp = related_thread_groups[i];
+		if (grp && atomic64_read(&grp->load) >= (s64)threshold)
+			return true;
+	}
+
+	return false;
+}
+
+int sched_set_group_id(struct task_struct *p, unsigned int group_id)
+{
+	struct rq *rq;
+	struct rq_flags rf;
+
+	if (group_id >= MAX_NUM_CGROUP_COLOC_ID)
+		return -EINVAL;
+
+	if (group_id == p->ravg.grp_id)
+		return 0;
+
+	raw_spin_lock_irq(&p->pi_lock);
+
+	rq = __task_rq_lock(p, &rf);
+	if (task_on_rq_queued(p))
+		walt_grp_load_add(p, -(s64)p->ravg.demand);
+
+	p->ravg.grp_id = group_id;
+
+	if (task_on_rq_queued(p))
+		walt_grp_load_add(p, p->ravg.demand);
+	__task_rq_unlock(rq, &rf);
+
+	raw_spin_unlock_irq(&p->pi_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL(sched_set_group_id);
+
+unsigned int sched_get_group_id(struct task_struct *p)
+{
+	return p->ravg.grp_id;
+}
+EXPORT_SYMBOL(sched_get_group_id);
+
+#ifdef CONFIG_DEBUG_FS
+static int rtg_show(struct seq_file *s, void *unused)
+{
+	int i;
+
+	seq_printf(s, "total_load=%lld active=%d\n",
+		   (long long)atomic64_read(&walt_rtg_total_load),
+		   walt_rtgb_active());
+
+	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++)
+		seq_printf(s, "group%d load=%lld\n", i,
+			   (long long)atomic64_read(
+					&related_thread_groups[i]->load));
+
+	return 0;
+}
+
+static int rtg_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rtg_show, NULL);
+}
+
+static ssize_t rtg_write(struct file *file, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	struct task_struct *task;
+	char kbuf[32];
+	int pid, gid, ret;
+
+	if (count == 0 || count >= sizeof(kbuf))
+		return -EINVAL;
+
+	if (copy_from_user(kbuf, ubuf, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	if (sscanf(kbuf, "%d %d", &pid, &gid) != 2 || gid < 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	task = find_task_by_vpid(pid);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+
+	if (!task)
+		return -ESRCH;
+
+	ret = sched_set_group_id(task, (unsigned int)gid);
+	put_task_struct(task);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations rtg_fops = {
+	.open		= rtg_open,
+	.read		= seq_read,
+	.write		= rtg_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int __init walt_rtg_debugfs_init(void)
+{
+	debugfs_create_file("sched_rtg", 0644, NULL, NULL, &rtg_fops);
+
+	return 0;
+}
+late_initcall(walt_rtg_debugfs_init);
+#endif /* CONFIG_DEBUG_FS */
+
+static int __init walt_rtg_init(void)
+{
+	int i;
+
+	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
+		related_thread_groups[i] =
+			kzalloc(sizeof(struct walt_related_thread_group),
+				GFP_KERNEL);
+		if (!related_thread_groups[i])
+			return -ENOMEM;
+
+		related_thread_groups[i]->id = i;
+		atomic64_set(&related_thread_groups[i]->load, 0);
+	}
+
+	return 0;
+}
+late_initcall(walt_rtg_init);
+
 void
 walt_inc_cumulative_runnable_avg(struct rq *rq,
 				 struct task_struct *p)
 {
 	rq->cumulative_runnable_avg += p->ravg.demand;
+	rq->pred_demands_sum += p->ravg.pred_demand;
+	walt_grp_load_add(p, (s64)p->ravg.demand);
 
 	/*
 	 * Add a task's contribution to the cumulative window demand when
@@ -94,6 +309,12 @@ walt_dec_cumulative_runnable_avg(struct rq *rq,
 {
 	rq->cumulative_runnable_avg -= p->ravg.demand;
 	BUG_ON((s64)rq->cumulative_runnable_avg < 0);
+
+	rq->pred_demands_sum -= p->ravg.pred_demand;
+	if ((s64)rq->pred_demands_sum < 0)
+		rq->pred_demands_sum = 0;
+
+	walt_grp_load_add(p, -(s64)p->ravg.demand);
 
 	/*
 	 * on_rq will be 1 for sleeping tasks. So check if the task
@@ -115,7 +336,24 @@ walt_fixup_cumulative_runnable_avg(struct rq *rq,
 		panic("cra less than zero: tld: %lld, task_load(p) = %u\n",
 			task_load_delta, task_load(p));
 
+	walt_grp_load_add(p, task_load_delta);
+
 	fixup_cum_window_demand(rq, task_load_delta);
+}
+
+/*
+ * Adjust the predicted demand sum of @rq for a new prediction of @p. Unlike
+ * the demand fixup above this is allowed to underflow: the prediction is a
+ * heuristic that can be revised downwards, so clamp instead of panicking.
+ */
+static void walt_fixup_pred_demand(struct rq *rq, struct task_struct *p,
+				   u32 new_pred)
+{
+	s64 delta = (s64)new_pred - (s64)p->ravg.pred_demand;
+
+	rq->pred_demands_sum += delta;
+	if ((s64)rq->pred_demands_sum < 0)
+		rq->pred_demands_sum = 0;
 }
 
 u64 walt_ktime_clock(void)
@@ -133,14 +371,51 @@ u64 walt_ktime_clock(void)
 	return ktime_to_ns(ktime_last);
 }
 
+/******************************************************************************
+ * WALT -> cpufreq governor callbacks (ported from Qualcomm's WALT)
+ *****************************************************************************/
+
+DEFINE_PER_CPU(struct waltgov_callback *, waltgov_cb_data);
+
+void waltgov_add_callback(int cpu, struct waltgov_callback *cb,
+			  void (*func)(struct waltgov_callback *cb, u64 time,
+				       unsigned int flags))
+{
+	if (WARN_ON(!cb || !func))
+		return;
+
+	if (WARN_ON(per_cpu(waltgov_cb_data, cpu)))
+		return;
+
+	cb->func = func;
+	rcu_assign_pointer(per_cpu(waltgov_cb_data, cpu), cb);
+}
+
+void waltgov_remove_callback(int cpu)
+{
+	rcu_assign_pointer(per_cpu(waltgov_cb_data, cpu), NULL);
+}
+
+void waltgov_run_callback(struct rq *rq, unsigned int flags)
+{
+	struct waltgov_callback *cb;
+
+	rcu_read_lock_sched();
+	cb = rcu_dereference_sched(
+		*per_cpu_ptr(&waltgov_cb_data, cpu_of(rq)));
+	if (cb)
+		cb->func(cb, walt_ktime_clock(), flags);
+	rcu_read_unlock_sched();
+}
+
 /*
  * WALT based CPU utilization for the "walt" cpufreq governor. Mirrors
  * cpu_util_freq() in fair.c but additionally reports the WALT load info
  * the Qualcomm walt governor consumes (nl/pl/rtgb_active/ws).
  *
- * nl (new task load) and rtgb_active (related thread group boost) do not
- * exist in this WALT implementation and are always 0/false; pl is
- * approximated with the accumulated load of the current window.
+ * nl (new task load) comes from the new task runnable sums, pl from the
+ * predictive demand sum and rtgb_active from the related thread group load
+ * tracker (see the reduced RTG port above).
  */
 unsigned long cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load)
 {
@@ -160,11 +435,18 @@ unsigned long cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load)
 		do_div(util, walt_ravg_window);
 
 		if (walt_load) {
-			u64 pl = rq->cumulative_runnable_avg;
+			u64 pl = rq->pred_demands_sum;
+			u64 nl = rq->nt_prev_runnable_sum;
 
 			pl <<= SCHED_CAPACITY_SHIFT;
 			do_div(pl, walt_ravg_window);
 			walt_load->pl = (unsigned long)pl;
+
+			nl <<= SCHED_CAPACITY_SHIFT;
+			do_div(nl, walt_ravg_window);
+			walt_load->nl = min_t(u64, nl, util);
+
+			walt_load->rtgb_active = walt_rtgb_active();
 			walt_load->ws = rq->window_start;
 		}
 	} else {
@@ -228,6 +510,20 @@ static int exiting_task(struct task_struct *p)
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * A task is considered "new" for the first WALT_NEW_TASK_ACTIVE_WINDOWS
+ * windows of its life (~100ms at the 20ms default window). The load of such
+ * tasks is tracked separately so that the walt governor can spot app
+ * startup / fork bursts and ramp up without waiting for the demand to build.
+ */
+#define WALT_NEW_TASK_ACTIVE_WINDOWS	5
+
+static inline bool is_new_task(struct task_struct *p)
+{
+	return !is_idle_task(p) && !exiting_task(p) &&
+		p->ravg.active_windows < WALT_NEW_TASK_ACTIVE_WINDOWS;
 }
 
 static int __init set_walt_ravg_window(char *str)
@@ -402,6 +698,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 	u64 window_start = rq->window_start;
 	u32 window_size = walt_ravg_window;
 	u64 delta;
+	u64 nt_delta = 0;
 
 	new_window = mark_start < window_start;
 	if (new_window) {
@@ -449,6 +746,14 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 
 			rq->prev_runnable_sum = prev_sum;
 			rq->curr_runnable_sum = 0;
+
+			/*
+			 * Roll the new task load over with the runnable sum.
+			 * Idle/exiting tasks never contribute to it.
+			 */
+			rq->nt_prev_runnable_sum = nr_full_windows ? 0 :
+						rq->nt_curr_runnable_sum;
+			rq->nt_curr_runnable_sum = 0;
 		}
 
 		return;
@@ -469,6 +774,8 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 		rq->curr_runnable_sum += delta;
 		if (!is_idle_task(p) && !exiting_task(p))
 			p->ravg.curr_window += delta;
+		if (is_new_task(p))
+			rq->nt_curr_runnable_sum += delta;
 
 		return;
 	}
@@ -500,12 +807,16 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 				p->ravg.prev_window = delta;
 		}
 		rq->prev_runnable_sum += delta;
+		if (is_new_task(p))
+			rq->nt_prev_runnable_sum += delta;
 
 		/* Account piece of busy time in the current window. */
 		delta = scale_exec_time(wallclock - window_start, rq);
 		rq->curr_runnable_sum += delta;
 		if (!exiting_task(p))
 			p->ravg.curr_window = delta;
+		if (is_new_task(p))
+			rq->nt_curr_runnable_sum += delta;
 
 		return;
 	}
@@ -529,6 +840,8 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			delta = scale_exec_time(window_start - mark_start, rq);
 			if (!is_idle_task(p) && !exiting_task(p))
 				p->ravg.prev_window += delta;
+			if (is_new_task(p))
+				nt_delta = delta;
 
 			delta += rq->curr_runnable_sum;
 		} else {
@@ -538,21 +851,27 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			delta = scale_exec_time(window_size, rq);
 			if (!is_idle_task(p) && !exiting_task(p))
 				p->ravg.prev_window = delta;
+			if (is_new_task(p))
+				nt_delta = delta;
 
 		}
 		/*
-		 * Rollover for normal runnable sum is done here by overwriting
-		 * the values in prev_runnable_sum and curr_runnable_sum.
-		 * Rollover for new task runnable sum has completed by previous
-		 * if-else statement.
+		 * Rollover for the normal runnable sum is done here by overwriting
+		 * the values in prev_runnable_sum and curr_runnable_sum. The new
+		 * task load is rolled over the same way: the load accumulated for
+		 * the current window becomes the previous window, plus this task's
+		 * own share of the window that just ended.
 		 */
 		rq->prev_runnable_sum = delta;
+		rq->nt_prev_runnable_sum =
+				rq->nt_curr_runnable_sum + nt_delta;
 
 		/* Account piece of busy time in the current window. */
 		delta = scale_exec_time(wallclock - window_start, rq);
 		rq->curr_runnable_sum = delta;
 		if (!is_idle_task(p) && !exiting_task(p))
 			p->ravg.curr_window = delta;
+		rq->nt_curr_runnable_sum = is_new_task(p) ? delta : 0;
 
 		return;
 	}
@@ -574,6 +893,8 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 		/* Roll window over. If IRQ busy time was just in the current
 		 * window then that is all that need be accounted. */
 		rq->prev_runnable_sum = rq->curr_runnable_sum;
+		rq->nt_prev_runnable_sum = rq->nt_curr_runnable_sum;
+		rq->nt_curr_runnable_sum = 0;
 		if (mark_start > window_start) {
 			rq->curr_runnable_sum = scale_exec_time(irqtime, rq);
 			return;
@@ -621,12 +942,165 @@ static int account_busy_for_task_demand(struct task_struct *p, int event)
  * when, say, a real-time task runs without preemption for several windows at a
  * stretch.
  */
+#define INC_STEP		8
+#define DEC_STEP		2
+#define CONSISTENT_THRES	16
+#define INC_STEP_BIG		16
+
+/*
+ * bucket_increase - update the count of all buckets
+ *
+ * @buckets: array of buckets tracking busy time of a task
+ * @idx: the index of bucket to be incremented
+ *
+ * Each time a complete window finishes, count of bucket that runtime
+ * falls in (@idx) is incremented. Counts of all other buckets are
+ * decayed. The rate of increase and decay could be different based
+ * on current count in the bucket.
+ */
+static inline void bucket_increase(u8 *buckets, int idx)
+{
+	int i, step;
+
+	for (i = 0; i < NUM_BUSY_BUCKETS; i++) {
+		if (idx != i) {
+			if (buckets[i] > DEC_STEP)
+				buckets[i] -= DEC_STEP;
+			else
+				buckets[i] = 0;
+		} else {
+			step = buckets[i] >= CONSISTENT_THRES ?
+						INC_STEP_BIG : INC_STEP;
+			if (buckets[i] > U8_MAX - step)
+				buckets[i] = U8_MAX;
+			else
+				buckets[i] += step;
+		}
+	}
+}
+
+static inline int busy_to_bucket(u32 normalized_rt)
+{
+	int bidx;
+
+	bidx = mult_frac(normalized_rt, NUM_BUSY_BUCKETS, walt_ravg_window);
+	bidx = min(bidx, NUM_BUSY_BUCKETS - 1);
+
+	/*
+	 * Combine lowest two buckets. The lowest frequency falls into
+	 * 2nd bucket and thus keep predicting lowest bucket is not
+	 * useful.
+	 */
+	if (!bidx)
+		bidx++;
+
+	return bidx;
+}
+
+/*
+ * get_pred_busy - calculate predicted demand for a task on runqueue
+ *
+ * @p: task whose prediction is being updated
+ * @start: starting bucket. returned prediction should not be lower than
+ *         this bucket.
+ * @runtime: runtime of the task. returned prediction should not be lower
+ *           than this runtime.
+ *
+ * A new predicted busy time is returned for task @p based on @runtime passed
+ * in. The function searches through buckets that represent busy time equal to
+ * or bigger than @runtime and attempts to find the bucket to use for
+ * prediction. Once found, it searches through historical busy time and returns
+ * the latest that falls into the bucket. If no such busy time exists, it
+ * returns the medium of that bucket.
+ */
+static u32 get_pred_busy(struct task_struct *p, int start, u32 runtime)
+{
+	int i;
+	u8 *buckets = p->ravg.busy_buckets;
+	u32 *hist = p->ravg.sum_history;
+	u32 dmin, dmax;
+	int first = NUM_BUSY_BUCKETS, final;
+	u32 ret = runtime;
+
+	/* skip prediction for new tasks due to lack of history */
+	if (unlikely(is_new_task(p)))
+		goto out;
+
+	/* find minimal bucket index to pick */
+	for (i = start; i < NUM_BUSY_BUCKETS; i++) {
+		if (buckets[i]) {
+			first = i;
+			break;
+		}
+	}
+
+	/* if no higher buckets are filled, predict runtime */
+	if (first >= NUM_BUSY_BUCKETS)
+		goto out;
+
+	/* compute the bucket for prediction */
+	final = first;
+
+	/* determine demand range for the predicted bucket */
+	if (final < 2) {
+		/* lowest two buckets are combined */
+		dmin = 0;
+		final = 1;
+	} else {
+		dmin = mult_frac(final, walt_ravg_window, NUM_BUSY_BUCKETS);
+	}
+	dmax = mult_frac(final + 1, walt_ravg_window, NUM_BUSY_BUCKETS);
+
+	/*
+	 * search through runtime history and return first runtime that falls
+	 * into the range of predicted bucket.
+	 */
+	for (i = 0; i < walt_ravg_hist_size; i++) {
+		if (hist[i] >= dmin && hist[i] < dmax) {
+			ret = hist[i];
+			break;
+		}
+	}
+
+	/* no historical runtime within bucket found, use average of the bin */
+	if (ret < dmin)
+		ret = (dmin + dmax) / 2;
+
+	/*
+	 * when updating in middle of a window, runtime could be higher than
+	 * all recorded history. Always predict at least runtime.
+	 */
+	ret = max(runtime, ret);
+
+out:
+	return ret;
+}
+
+static inline u32 calc_pred_demand(struct task_struct *p)
+{
+	if (p->ravg.pred_demand >= p->ravg.curr_window)
+		return p->ravg.pred_demand;
+
+	return get_pred_busy(p, busy_to_bucket(p->ravg.curr_window),
+			     p->ravg.curr_window);
+}
+
+static inline u32 predict_and_update_buckets(struct task_struct *p,
+					     u32 runtime)
+{
+	int bidx = busy_to_bucket(runtime);
+	u32 pred_demand = get_pred_busy(p, bidx, runtime);
+
+	bucket_increase(p->ravg.busy_buckets, bidx);
+
+	return pred_demand;
+}
 static void update_history(struct rq *rq, struct task_struct *p,
 			 u32 runtime, int samples, int event)
 {
 	u32 *hist = &p->ravg.sum_history[0];
 	int ridx, widx;
-	u32 max = 0, avg, demand;
+	u32 max = 0, avg, demand, pred_demand;
 	u64 sum = 0;
 
 	/* Ignore windows where task had no activity */
@@ -664,6 +1138,8 @@ static void update_history(struct rq *rq, struct task_struct *p,
 			demand = max(avg, runtime);
 	}
 
+	pred_demand = predict_and_update_buckets(p, runtime);
+
 	/*
 	 * A throttled deadline sched class task gets dequeued without
 	 * changing p->on_rq. Since the dequeue decrements hmp stats
@@ -676,6 +1152,14 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	 * average. So add the task demand separately to cumulative window
 	 * demand.
 	 */
+	/*
+	 * Keep the rq's predicted demand sum in sync with the new prediction
+	 * before p->ravg.pred_demand is updated below.
+	 */
+	if (task_on_rq_queued(p) &&
+	    (!task_has_dl_policy(p) || !p->dl.dl_throttled))
+		walt_fixup_pred_demand(rq, p, pred_demand);
+
 	if (!task_has_dl_policy(p) || !p->dl.dl_throttled) {
 		if (task_on_rq_queued(p))
 			p->sched_class->fixup_cumulative_runnable_avg(rq, p,
@@ -685,10 +1169,49 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	}
 
 	p->ravg.demand = demand;
+	p->ravg.pred_demand = pred_demand;
 
 done:
 	trace_walt_update_history(rq, p, runtime, samples, event);
 	return;
+}
+
+/*
+ * Predictive demand of a task is calculated at the window roll-over. If the
+ * task's busy time in the current window exceeds the prediction, update it
+ * here to reflect what the task needs.
+ */
+static void update_task_pred_demand(struct rq *rq, struct task_struct *p,
+				    int event)
+{
+	u32 new, old;
+
+	if (is_idle_task(p) || exiting_task(p))
+		return;
+
+	if (event != PUT_PREV_TASK && event != TASK_UPDATE &&
+	    (!walt_freq_account_wait_time ||
+	     (event != TASK_MIGRATE && event != PICK_NEXT_TASK)))
+		return;
+
+	/*
+	 * TASK_UPDATE can be called on a sleeping task, when it is moved
+	 * between related groups.
+	 */
+	if (event == TASK_UPDATE && !p->on_rq && !walt_freq_account_wait_time)
+		return;
+
+	new = calc_pred_demand(p);
+	old = p->ravg.pred_demand;
+
+	if (old >= new)
+		return;
+
+	if (task_on_rq_queued(p) &&
+	    (!task_has_dl_policy(p) || !p->dl.dl_throttled))
+		walt_fixup_pred_demand(rq, p, new);
+
+	p->ravg.pred_demand = new;
 }
 
 static void add_to_task_demand(struct rq *rq, struct task_struct *p,
@@ -806,6 +1329,9 @@ static void update_task_demand(struct task_struct *p, struct rq *rq,
 void walt_update_task_ravg(struct task_struct *p, struct rq *rq,
 	     int event, u64 wallclock, u64 irqtime)
 {
+	u64 window_start;
+	unsigned int flags = 0;
+
 	if (walt_disabled || !rq->window_start)
 		return;
 
@@ -820,15 +1346,31 @@ void walt_update_task_ravg(struct task_struct *p, struct rq *rq,
 	 */
 	//lockdep_assert_held(&rq->lock);
 
+	window_start = rq->window_start;
 	update_window_start(rq, wallclock);
+	if (rq->window_start != window_start)
+		flags |= WALT_CPUFREQ_ROLLOVER;
 
 	if (!p->ravg.mark_start)
 		goto done;
 
+	if (event == TASK_MIGRATE)
+		flags |= WALT_CPUFREQ_IC_MIGRATION;
+
 	update_task_demand(p, rq, event, wallclock);
 	update_cpu_busy_time(p, rq, event, wallclock, irqtime);
+	update_task_pred_demand(rq, p, event);
 
 done:
+	/*
+	 * Let the "walt" cpufreq governor look at the new data. IRQ_UPDATE is
+	 * left out because it runs from the IRQ accounting path (i.e. on every
+	 * interrupt); the regular events - tick, wakeup, migration and window
+	 * rollover - provide enough granularity.
+	 */
+	if (event != IRQ_UPDATE)
+		waltgov_run_callback(rq, flags);
+
 	trace_walt_update_task_ravg(p, rq, event, wallclock, irqtime);
 
 	p->ravg.mark_start = wallclock;
@@ -873,6 +1415,7 @@ void walt_set_window_start(struct rq *rq, struct rq_flags *rf)
 		double_lock_balance(rq, sync_rq);
 		rq->window_start = sync_rq->window_start;
 		rq->curr_runnable_sum = rq->prev_runnable_sum = 0;
+		rq->nt_curr_runnable_sum = rq->nt_prev_runnable_sum = 0;
 		raw_spin_unlock(&sync_rq->lock);
 		rq_repin_lock(rq, rf);
 	}
@@ -936,11 +1479,21 @@ void walt_fixup_busy_time(struct task_struct *p, int new_cpu)
 	if (p->ravg.curr_window) {
 		src_rq->curr_runnable_sum -= p->ravg.curr_window;
 		dest_rq->curr_runnable_sum += p->ravg.curr_window;
+
+		if (is_new_task(p)) {
+			src_rq->nt_curr_runnable_sum -= p->ravg.curr_window;
+			dest_rq->nt_curr_runnable_sum += p->ravg.curr_window;
+		}
 	}
 
 	if (p->ravg.prev_window) {
 		src_rq->prev_runnable_sum -= p->ravg.prev_window;
 		dest_rq->prev_runnable_sum += p->ravg.prev_window;
+
+		if (is_new_task(p)) {
+			src_rq->nt_prev_runnable_sum -= p->ravg.prev_window;
+			dest_rq->nt_prev_runnable_sum += p->ravg.prev_window;
+		}
 	}
 
 	if ((s64)src_rq->prev_runnable_sum < 0) {
@@ -951,6 +1504,10 @@ void walt_fixup_busy_time(struct task_struct *p, int new_cpu)
 		src_rq->curr_runnable_sum = 0;
 		WARN_ON(1);
 	}
+	if ((s64)src_rq->nt_prev_runnable_sum < 0)
+		src_rq->nt_prev_runnable_sum = 0;
+	if ((s64)src_rq->nt_curr_runnable_sum < 0)
+		src_rq->nt_curr_runnable_sum = 0;
 
 	trace_walt_migration_update_sum(src_rq, p);
 	trace_walt_migration_update_sum(dest_rq, p);
@@ -978,4 +1535,7 @@ void walt_init_new_task_load(struct task_struct *p)
 	p->ravg.demand = init_load_windows;
 	for (i = 0; i < RAVG_HIST_SIZE_MAX; ++i)
 		p->ravg.sum_history[i] = init_load_windows;
+
+	/* A child inherits the related thread group of its parent */
+	p->ravg.grp_id = current->ravg.grp_id;
 }

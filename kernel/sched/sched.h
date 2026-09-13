@@ -861,6 +861,7 @@ struct rq {
 
 #ifdef CONFIG_SCHED_WALT
 	u64 cumulative_runnable_avg;
+	u64 pred_demands_sum;
 	u64 window_start;
 	u64 curr_runnable_sum;
 	u64 prev_runnable_sum;

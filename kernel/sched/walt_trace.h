@@ -18,10 +18,10 @@ TRACE_EVENT(waltgov_next_freq,
 	TP_PROTO(int cpu, unsigned long util, unsigned long max,
 		 unsigned int raw_freq, unsigned int freq,
 		 unsigned long avg_cap, unsigned long pl, int hiload,
-		 int boost, unsigned int flags),
+		 int boost, unsigned int flags, unsigned long nl, int rtgb),
 
 	TP_ARGS(cpu, util, max, raw_freq, freq, avg_cap, pl, hiload, boost,
-		flags),
+		flags, nl, rtgb),
 
 	TP_STRUCT__entry(
 		__field(	int,		cpu		)
@@ -34,6 +34,8 @@ TRACE_EVENT(waltgov_next_freq,
 		__field(	int,		hiload		)
 		__field(	int,		boost		)
 		__field(	unsigned int,	flags		)
+		__field(	unsigned long,	nl		)
+		__field(	int,		rtgb		)
 	),
 
 	TP_fast_assign(
@@ -47,13 +49,15 @@ TRACE_EVENT(waltgov_next_freq,
 		__entry->hiload		= hiload;
 		__entry->boost		= boost;
 		__entry->flags		= flags;
+		__entry->nl		= nl;
+		__entry->rtgb		= rtgb;
 	),
 
-	TP_printk("cpu=%d util=%lu max=%lu raw_freq=%u freq=%u avg_cap=%lu pl=%lu hiload=%d boost=%d flags=0x%x",
+	TP_printk("cpu=%d util=%lu max=%lu raw_freq=%u freq=%u avg_cap=%lu pl=%lu hiload=%d boost=%d flags=0x%x nl=%lu rtgb=%d",
 		  __entry->cpu, __entry->util, __entry->max,
 		  __entry->raw_freq, __entry->freq, __entry->avg_cap,
 		  __entry->pl, __entry->hiload, __entry->boost,
-		  __entry->flags)
+		  __entry->flags, __entry->nl, __entry->rtgb)
 );
 
 #endif /* _TRACE_WALTGOV_H */

@@ -26,6 +26,9 @@ static ssize_t governor_show(struct kobject *kobj, struct attribute *attr,
 {
 	struct governor_attr *gattr = to_gov_attr(attr);
 
+	if (!gattr->show)
+		return -EIO;
+
 	return gattr->show(to_gov_attr_set(kobj), buf);
 }
 
@@ -35,6 +38,17 @@ static ssize_t governor_store(struct kobject *kobj, struct attribute *attr,
 	struct gov_attr_set *attr_set = to_gov_attr_set(kobj);
 	struct governor_attr *gattr = to_gov_attr(attr);
 	int ret;
+
+	/*
+	 * Some governor attributes are read-only (e.g. the "decision" node of
+	 * the walt governor). sysfs does not enforce the attribute mode for a
+	 * task holding CAP_DAC_OVERRIDE, so a privileged writer can reach this
+	 * point for such an attribute; refuse the write instead of calling a
+	 * NULL store callback (which faults with an instruction abort at
+	 * address 0).
+	 */
+	if (!gattr->store)
+		return -EACCES;
 
 	mutex_lock(&attr_set->update_lock);
 	ret = attr_set->usage_count ? gattr->store(attr_set, buf, count) : -EBUSY;

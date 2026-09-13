@@ -3,14 +3,19 @@
  * (kernel/sched/walt/cpufreq_walt.c) on top of the MTK schedutil framework
  * used by this kernel.
  *
- * Deviations from the original Qualcomm driver (this kernel's WALT backport
- * does not provide the newer WALT infrastructure):
- *  - no waltgov callbacks; the standard cpufreq update-util hooks are used,
- *  - "rtg_boost_freq" is not provided (no related-thread-group support),
- *  - "new task load" (nl) is unavailable and is always 0,
- *  - "pl" is approximated with WALT's current window accumulated load,
- *  - util -> frequency goes through the platform mapping used by schedutil
- *    (upower tables / mt_cpufreq helpers) instead of a linear formula.
+ * Deviations from the original Qualcomm driver:
+ *  - the governor is driven through the waltgov callbacks exported by WALT
+ *    (window rollover, wakeup, tick, migration) instead of the generic
+ *    cpufreq update-util hooks,
+ *  - "rtg_boost_freq" is driven by a reduced port of Qualcomm's RTG: tasks
+ *    carry a group id (sched_set_group_id()), a group's load is the sum of
+ *    its queued tasks' demand and the boost triggers while that load exceeds
+ *    half of the least capable CPU. Cgroup colocation, group time accounting
+ *    (grp_time) and preferred-cluster placement are not ported,
+ *  - "pl" uses WALT's predictive demand sum (bucket based prediction); the
+ *    conservative_pl scaling of the original driver is not applied,
+ *  - the schedutil iowait boost and the SCHED_CPUFREQ_DL "jump to max"
+ *    handling are not part of the original governor and are dropped here.
  *
  * Copyright (C) 2016, Intel Corporation
  * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
@@ -54,6 +59,7 @@ struct sugov_tunables {
 	/* Tunables ported from Qualcomm's walt governor */
 	unsigned int hispeed_load;		/* %% of average capacity */
 	unsigned int hispeed_freq;		/* kHz */
+	unsigned int rtg_boost_freq;		/* kHz (requires RTG support) */
 	unsigned int adaptive_low_freq;		/* kHz */
 	unsigned int adaptive_high_freq;	/* kHz */
 	unsigned int target_load_thresh;	/* capacity scale */
@@ -87,10 +93,13 @@ struct sugov_policy {
 	u64 update_count;
 	u64 hispeed_hits;
 	u64 pl_hits;
+	u64 nl_hits;
 	unsigned long last_util;
 	unsigned long last_max;
 	unsigned long last_avg_cap;
 	unsigned long last_pl;
+	unsigned long last_nl;
+	bool last_rtgb;
 	unsigned int last_raw_freq;
 	unsigned int last_freq;
 	unsigned int last_cpu;
@@ -108,20 +117,16 @@ struct sugov_policy {
 };
 
 struct sugov_cpu {
-	struct update_util_data update_util;
+	struct waltgov_callback cb;
 	struct sugov_policy *sg_policy;
 	unsigned int cpu;
 
-	bool iowait_boost_pending;
-	unsigned int iowait_boost;
-	unsigned int iowait_boost_max;
 	u64 last_update;
 
 	/* The fields below are only needed when sharing a policy. */
 	unsigned long util;
 	unsigned long max;
 	unsigned int flags;
-	unsigned long min_boost;
 
 	/* WALT load info collected by cpu_util_freq_walt() */
 	struct walt_cpu_load walt_load;
@@ -294,6 +299,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
  * kernel/sched/walt/cpufreq_walt.c.
  */
 #define WALT_TARGET_LOAD		80
+#define WALT_NL_RATIO			75
 #define WALT_KHZ			1000
 #define WALT_DEFAULT_HISPEED_LOAD	90
 #define WALT_DEFAULT_TARGET_LOAD_THRESH	1024
@@ -313,7 +319,17 @@ static unsigned long walt_target_util(struct sugov_policy *sg_policy,
 {
 	unsigned long util = walt_freq_to_util(sg_policy, freq);
 
-	return mult_frac(util, WALT_TARGET_LOAD, 100);
+	/*
+	 * Above the target load threshold the original governor keeps only 6%
+	 * headroom instead of the usual 25%, i.e. the target utilization at
+	 * that frequency is 94% of the capacity rather than 80%.
+	 */
+	if (util >= sg_policy->tunables->target_load_thresh)
+		util = mult_frac(util, 94, 100);
+	else
+		util = mult_frac(util, WALT_TARGET_LOAD, 100);
+
+	return util;
 }
 
 static void walt_track_cycles(struct sugov_policy *sg_policy,
@@ -362,21 +378,31 @@ static void walt_calc_avg_cap(struct sugov_policy *sg_policy, u64 curr_ws,
 }
 
 /*
- * Mirrors waltgov_walt_adjust(). The original RTG boost and new task load
- * (nl) inputs are not available in this kernel's WALT, so only the hispeed
- * and load prediction (pl) parts are applied here.
+ * Mirrors waltgov_walt_adjust() of the original governor: apply the RTG
+ * boost, the hispeed boost, the new task load (nl) fast ramp and the
+ * predictive load (pl) of WALT.
  */
 static void walt_adjust_util(struct sugov_cpu *sg_cpu, unsigned long cpu_util,
 			     unsigned long *util, unsigned long *max)
 {
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	struct sugov_tunables *tunables = sg_policy->tunables;
+	unsigned long pl = sg_cpu->walt_load.pl;
+	unsigned long nl = sg_cpu->walt_load.nl;
+	bool is_migration = sg_cpu->flags & WALT_CPUFREQ_IC_MIGRATION;
 	bool is_hiload;
+
+	if (sg_cpu->walt_load.rtgb_active && tunables->rtg_boost_freq) {
+		unsigned long rtgb = walt_target_util(sg_policy,
+						tunables->rtg_boost_freq);
+
+		*util = max(*util, rtgb);
+	}
 
 	is_hiload = (cpu_util >= mult_frac(sg_policy->avg_cap,
 					   tunables->hispeed_load, 100));
 
-	if (is_hiload && tunables->hispeed_freq) {
+	if (is_hiload && !is_migration && tunables->hispeed_freq) {
 		unsigned long hs = walt_target_util(sg_policy,
 						    tunables->hispeed_freq);
 
@@ -385,10 +411,20 @@ static void walt_adjust_util(struct sugov_cpu *sg_cpu, unsigned long cpu_util,
 		*util = max(*util, hs);
 	}
 
-	if (tunables->pl && sg_cpu->walt_load.pl) {
-		if (sg_cpu->walt_load.pl > *util)
+	/*
+	 * A large part of the load comes from newly started tasks (app launch,
+	 * forks): jump to the maximum frequency instead of building up over
+	 * several windows.
+	 */
+	if (is_hiload && nl >= mult_frac(cpu_util, WALT_NL_RATIO, 100)) {
+		sg_policy->nl_hits++;
+		*util = *max;
+	}
+
+	if (tunables->pl && pl) {
+		if (pl > *util)
 			sg_policy->pl_hits++;
-		*util = max(*util, sg_cpu->walt_load.pl);
+		*util = max(*util, pl);
 	}
 }
 
@@ -401,7 +437,10 @@ static void waltgov_trace_decision(struct sugov_policy *sg_policy, int cpu,
 				   unsigned int freq, unsigned int flags)
 {
 	struct sugov_tunables *tunables = sg_policy->tunables;
-	unsigned long pl = per_cpu(sugov_cpu, cpu).walt_load.pl;
+	struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
+	unsigned long pl = sg_cpu->walt_load.pl;
+	unsigned long nl = sg_cpu->walt_load.nl;
+	bool rtgb = sg_cpu->walt_load.rtgb_active;
 	bool hiload = (util >= mult_frac(sg_policy->avg_cap,
 					 tunables->hispeed_load, 100));
 
@@ -411,6 +450,8 @@ static void waltgov_trace_decision(struct sugov_policy *sg_policy, int cpu,
 	sg_policy->last_max = max;
 	sg_policy->last_avg_cap = sg_policy->avg_cap;
 	sg_policy->last_pl = pl;
+	sg_policy->last_nl = nl;
+	sg_policy->last_rtgb = rtgb;
 	sg_policy->last_raw_freq = sg_policy->cached_raw_freq;
 	sg_policy->last_freq = freq;
 	sg_policy->last_flags = flags;
@@ -418,50 +459,60 @@ static void waltgov_trace_decision(struct sugov_policy *sg_policy, int cpu,
 
 	trace_waltgov_next_freq(cpu, util, max, sg_policy->cached_raw_freq,
 				freq, sg_policy->avg_cap, pl, hiload,
-				tunables->boost, flags);
+				tunables->boost, flags, nl, rtgb);
 }
 
 /*
- * Qualcomm maps frequencies as
- *	freq ~ max((1 + 2^-shift) * util, 1.25 * thresh) * fmax / cap
- * for util >= target_load_thresh, i.e. the 25%% headroom of the platform
- * mapping is reduced above the threshold. The platform mapping adds a
- * 1.25 factor itself, so pre-scale the utilization accordingly.
+ * Qualcomm's linear util -> frequency mapping:
+ *
+ *	freq = (1 + 1/4) * util * fmax / cap		(25% headroom)
+ *
+ * and, once the utilization is above target_load_thresh and there is no
+ * significant RT load on the CPU,
+ *
+ *	freq = max((1 + 2^-target_load_shift) * util,
+ *		   1.25 * target_load_thresh) * fmax / cap
+ *
+ * i.e. the headroom shrinks towards the target load.
  */
-static unsigned long walt_apply_target_load(struct sugov_tunables *tunables,
-					    unsigned long util)
+static unsigned long walt_map_util_freq(struct sugov_policy *sg_policy,
+					unsigned long util, unsigned long cap,
+					int cpu)
 {
-	unsigned long thresh = tunables->target_load_thresh;
-	unsigned long scaled;
+	unsigned long fmax = sg_policy->policy->cpuinfo.max_freq;
+	unsigned int shift = sg_policy->tunables->target_load_shift;
+	unsigned long rt_util = READ_ONCE(cpu_rq(cpu)->rt.avg.util_avg);
 
-	if (!thresh || util < thresh)
-		return util;
+	if (util >= sg_policy->tunables->target_load_thresh &&
+	    rt_util < (cap >> 2))
+		return max((fmax + (fmax >> shift)) * util,
+			   (fmax + (fmax >> 2)) *
+				sg_policy->tunables->target_load_thresh) / cap;
 
-	scaled = mult_frac(util, 100 + (100 >> tunables->target_load_shift),
-			   125);
-
-	return max(scaled, thresh);
+	return (fmax + (fmax >> 2)) * util / cap;
 }
 
 static unsigned int walt_get_next_freq(struct sugov_policy *sg_policy,
-				       unsigned long util, unsigned long max)
+				       unsigned long util, unsigned long max,
+				       int cpu)
 {
-	util = walt_apply_target_load(sg_policy->tunables, util);
-
-	return get_next_freq(sg_policy, util, max);
-}
-
-/*
- * Adaptive frequency band of the original governor: hold the frequency at
- * adaptive_high_freq for anything in between adaptive_low_freq and
- * adaptive_high_freq, and never go below adaptive_low_freq while set.
- */
-static unsigned int walt_apply_adaptive_freq(struct cpufreq_policy *policy,
-					     unsigned int freq)
-{
-	struct sugov_policy *sg_policy = policy->governor_data;
+	struct cpufreq_policy *policy = sg_policy->policy;
 	struct sugov_tunables *tunables = sg_policy->tunables;
+	unsigned int freq, raw_freq;
+#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
+	int cid;
+#endif
 
+	raw_freq = walt_map_util_freq(sg_policy, util, max, cpu);
+	sg_policy->cached_raw_freq = raw_freq;
+
+	freq = raw_freq;
+
+	/*
+	 * Adaptive frequency band of the original governor: hold the frequency
+	 * at adaptive_high_freq for anything in between adaptive_low_freq and
+	 * adaptive_high_freq, and never go below adaptive_low_freq while set.
+	 */
 	if (tunables->adaptive_high_freq) {
 		if (freq < tunables->adaptive_low_freq)
 			freq = tunables->adaptive_low_freq;
@@ -469,9 +520,21 @@ static unsigned int walt_apply_adaptive_freq(struct cpufreq_policy *policy,
 			freq = tunables->adaptive_high_freq;
 	}
 
-	return cpufreq_driver_resolve_freq(policy, freq);
+	freq = clamp_val(freq, policy->min, policy->max);
+#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
+	cid = arch_get_cluster_id(policy->cpu);
+	freq = mt_cpufreq_find_close_freq(cid, freq);
+#else
+	freq = cpufreq_driver_resolve_freq(policy, freq);
+#endif
+	return freq;
 }
 
+/*
+ * Adaptive frequency band of the original governor is applied inside
+ * walt_get_next_freq(); this helper only exists for readability of the
+ * update paths below.
+ */
 static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long *util,
 			   unsigned long *max)
 {
@@ -492,80 +555,21 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long *util,
 	*util = uclamp_util(cpu_rq(sg_cpu->cpu), *util);
 
 	/* Qualcomm waltgov "boost" tunable (percent, may be negative) */
-	if (sg_policy->tunables->boost)
-		*util = mult_frac(*util, 100 + sg_policy->tunables->boost, 100);
+	if (sg_policy->tunables->boost) {
+		int b = sg_policy->tunables->boost;
+
+		*util = mult_frac(*util, 100 + b, 100);
+		sg_cpu->walt_load.nl = mult_frac(sg_cpu->walt_load.nl,
+						 100 + b, 100);
+	}
 
 	*max = max_cap;
 }
 
-static void sugov_set_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
-				   unsigned int flags)
-{
-	unsigned int max_boost;
-
-	if (flags & SCHED_CPUFREQ_IOWAIT) {
-		if (sg_cpu->iowait_boost_pending)
-			return;
-
-		sg_cpu->iowait_boost_pending = true;
-
-		/*
-		 * Boost FAIR tasks only up to the CPU clamped utilization.
-		 *
-		 * Since DL tasks have a much more advanced bandwidth control,
-		 * it's safe to assume that IO boost does not apply to
-		 * those tasks.
-		 * Instead, since RT tasks are currently not utiliation clamped,
-		 * we don't want to apply clamping on IO boost while there is
-		 * blocked RT utilization.
-		 */
-		max_boost = sg_cpu->iowait_boost_max;
-		max_boost = uclamp_util(cpu_rq(sg_cpu->cpu), max_boost);
-
-		if (sg_cpu->iowait_boost) {
-			sg_cpu->iowait_boost <<= 1;
-			if (sg_cpu->iowait_boost > max_boost)
-				sg_cpu->iowait_boost = max_boost;
-		} else {
-			sg_cpu->iowait_boost = sg_cpu->min_boost;
-		}
-	} else if (sg_cpu->iowait_boost) {
-		s64 delta_ns = time - sg_cpu->last_update;
-
-		/* Clear iowait_boost if the CPU apprears to have been idle. */
-		if (delta_ns > TICK_NSEC) {
-			sg_cpu->iowait_boost = 0;
-			sg_cpu->iowait_boost_pending = false;
-		}
-	}
-}
-
-static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, unsigned long *util,
-			       unsigned long *max)
-{
-	unsigned int boost_util, boost_max;
-
-	if (!sg_cpu->iowait_boost)
-		return;
-
-	if (sg_cpu->iowait_boost_pending) {
-		sg_cpu->iowait_boost_pending = false;
-	} else {
-		sg_cpu->iowait_boost >>= 1;
-		if (sg_cpu->iowait_boost < sg_cpu->min_boost) {
-			sg_cpu->iowait_boost = 0;
-			return;
-		}
-	}
-
-	boost_util = sg_cpu->iowait_boost;
-	boost_max = sg_cpu->iowait_boost_max;
-
-	if (*util * boost_max < *max * boost_util) {
-		*util = boost_util;
-		*max = boost_max;
-	}
-}
+/*
+ * The original governor has no iowait boost and it cannot be fed by WALT's
+ * events anyway, so the schedutil variant of it is not carried over.
+ */
 
 #ifdef CONFIG_NO_HZ_COMMON
 static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
@@ -580,20 +584,20 @@ static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
 static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
 #endif /* CONFIG_NO_HZ_COMMON */
 
-static void sugov_update_single(struct update_util_data *hook, u64 time,
-				unsigned int flags)
+static void waltgov_update_freq_single(struct waltgov_callback *cb, u64 time,
+				       unsigned int flags)
 {
-	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+	struct sugov_cpu *sg_cpu = container_of(cb, struct sugov_cpu, cb);
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned long util, max;
 	unsigned int next_f;
 	bool busy;
-#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
-	int cid;
-#endif
 
-	sugov_set_iowait_boost(sg_cpu, time, flags);
+	if (!sg_policy->tunables->pl && (flags & WALT_CPUFREQ_PL))
+		return;
+
+	sg_cpu->flags = flags;
 	sg_cpu->last_update = time;
 
 	if (!sugov_should_update_freq(sg_policy, time))
@@ -601,37 +605,36 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 
 	busy = sugov_cpu_is_busy(sg_cpu);
 
-	if (flags & SCHED_CPUFREQ_DL) {
-		next_f = policy->cpuinfo.max_freq;
-	} else {
-		sugov_get_util(sg_cpu, &util, &max);
-		walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
-				  policy->cur);
-		walt_adjust_util(sg_cpu, util, &util, &max);
-		sugov_iowait_boost(sg_cpu, &util, &max);
-		next_f = walt_get_next_freq(sg_policy, util, max);
-		next_f = walt_apply_adaptive_freq(policy, next_f);
-#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
-		next_f = clamp_val(next_f, policy->min, policy->max);
-		cid = arch_get_cluster_id(sg_policy->policy->cpu);
-		next_f = mt_cpufreq_find_close_freq(cid, next_f);
-#endif
-		waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max,
-				       next_f, flags);
-		/*
-		 * Do not reduce the frequency if the CPU has not been idle
-		 * recently, as the reduction is likely to be premature then.
-		 */
-		if (busy && next_f < sg_policy->next_freq &&
-		    sg_policy->next_freq != UINT_MAX) {
-			next_f = sg_policy->next_freq;
+	sugov_get_util(sg_cpu, &util, &max);
 
-			/* Reset cached freq as next_freq has changed */
-			sg_policy->cached_raw_freq = 0;
-		}
+	/*
+	 * WALT may invoke this callback for a remote rq as well (task
+	 * migration), so serialise the decision with the policy lock just like
+	 * the shared-policy path does.
+	 */
+	raw_spin_lock(&sg_policy->update_lock);
+
+	walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws, policy->cur);
+	walt_adjust_util(sg_cpu, util, &util, &max);
+	next_f = walt_get_next_freq(sg_policy, util, max, sg_cpu->cpu);
+	waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max, next_f,
+			       flags);
+
+	/*
+	 * Do not reduce the frequency if the CPU has not been idle recently,
+	 * as the reduction is likely to be premature then.
+	 */
+	if (busy && next_f < sg_policy->next_freq &&
+	    sg_policy->next_freq != UINT_MAX) {
+		next_f = sg_policy->next_freq;
+
+		/* Reset cached freq as next_freq has changed */
+		sg_policy->cached_raw_freq = 0;
 	}
 
 	sugov_update_commit(sg_policy, time, next_f);
+
+	raw_spin_unlock(&sg_policy->update_lock);
 }
 
 static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
@@ -641,9 +644,6 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	unsigned long util = 0, max = 1;
 	unsigned int j;
 	unsigned int next_f;
-#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
-	int cid;
-#endif
 
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
@@ -652,20 +652,12 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 
 		/*
 		 * If the CPU utilization was last updated before the previous
-		 * frequency update and the time elapsed between the last update
-		 * of the CPU utilization and the last frequency update is long
-		 * enough, don't take the CPU into account as it probably is
-		 * idle now (and clear iowait_boost for it).
+		 * frequency update and the time elapsed since then is long enough,
+		 * don't take the CPU into account as it probably is idle now.
 		 */
 		delta_ns = time - j_sg_cpu->last_update;
-		if (delta_ns > TICK_NSEC) {
-			j_sg_cpu->iowait_boost = 0;
-			j_sg_cpu->iowait_boost_pending = false;
-			if (idle_cpu(j))
-				continue;
-		}
-		if (j_sg_cpu->flags & SCHED_CPUFREQ_DL)
-			return policy->cpuinfo.max_freq;
+		if (delta_ns > TICK_NSEC && idle_cpu(j))
+			continue;
 
 		j_util = j_sg_cpu->util;
 		j_max = j_sg_cpu->max;
@@ -676,30 +668,24 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		}
 
 		walt_adjust_util(j_sg_cpu, j_util, &util, &max);
-
-		sugov_iowait_boost(j_sg_cpu, &util, &max);
 	}
 
-	next_f = walt_get_next_freq(sg_policy, util, max);
-	next_f = walt_apply_adaptive_freq(policy, next_f);
-
-#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
-	next_f = clamp_val(next_f, policy->min, policy->max);
-	cid = arch_get_cluster_id(sg_policy->policy->cpu);
-	next_f = mt_cpufreq_find_close_freq(cid, next_f);
-#endif
+	next_f = walt_get_next_freq(sg_policy, util, max, sg_cpu->cpu);
 	waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max, next_f,
 			       sg_cpu->flags);
 	return next_f;
 }
 
-static void sugov_update_shared(struct update_util_data *hook, u64 time,
-				unsigned int flags)
+static void waltgov_update_freq_shared(struct waltgov_callback *cb, u64 time,
+				       unsigned int flags)
 {
-	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+	struct sugov_cpu *sg_cpu = container_of(cb, struct sugov_cpu, cb);
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long util, max;
 	unsigned int next_f;
+
+	if (!sg_policy->tunables->pl && (flags & WALT_CPUFREQ_PL))
+		return;
 
 	sugov_get_util(sg_cpu, &util, &max);
 
@@ -709,17 +695,12 @@ static void sugov_update_shared(struct update_util_data *hook, u64 time,
 	sg_cpu->max = max;
 	sg_cpu->flags = flags;
 
-	sugov_set_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
 
 	if (sugov_should_update_freq(sg_policy, time)) {
 		walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
 				  sg_policy->policy->cur);
-		if (flags & SCHED_CPUFREQ_DL)
-			next_f = sg_policy->policy->cpuinfo.max_freq;
-		else
-			next_f = sugov_next_freq_shared(sg_cpu, time);
-
+		next_f = sugov_next_freq_shared(sg_cpu, time);
 
 		sugov_update_commit(sg_policy, time, next_f);
 	}
@@ -943,6 +924,8 @@ WALTGOV_SHOW(hispeed_load);
 WALTGOV_STORE(hispeed_load);
 WALTGOV_SHOW(hispeed_freq);
 WALTGOV_STORE(hispeed_freq);
+WALTGOV_SHOW(rtg_boost_freq);
+WALTGOV_STORE(rtg_boost_freq);
 WALTGOV_SHOW(adaptive_low_freq);
 WALTGOV_STORE(adaptive_low_freq);
 WALTGOV_SHOW(adaptive_high_freq);
@@ -998,6 +981,7 @@ static ssize_t boost_store(struct gov_attr_set *attr_set, const char *buf,
 
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
 static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
+static struct governor_attr rtg_boost_freq = __ATTR_RW(rtg_boost_freq);
 static struct governor_attr adaptive_low_freq = __ATTR_RW(adaptive_low_freq);
 static struct governor_attr adaptive_high_freq = __ATTR_RW(adaptive_high_freq);
 static struct governor_attr target_load_thresh = __ATTR_RW(target_load_thresh);
@@ -1013,15 +997,17 @@ static ssize_t decision_show(struct gov_attr_set *attr_set, char *buf)
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		len += sprintf(buf + len,
-			"policy%u cpu=%u util=%lu max=%lu avg_cap=%lu pl=%lu raw_freq=%u freq=%u flags=0x%x updates=%llu hispeed_hits=%llu pl_hits=%llu\n",
+			"policy%u cpu=%u util=%lu max=%lu avg_cap=%lu pl=%lu nl=%lu rtgb=%d raw_freq=%u freq=%u flags=0x%x updates=%llu hispeed_hits=%llu pl_hits=%llu nl_hits=%llu\n",
 				sg_policy->policy->cpu, sg_policy->last_cpu,
 				sg_policy->last_util, sg_policy->last_max,
 				sg_policy->last_avg_cap, sg_policy->last_pl,
+				sg_policy->last_nl, sg_policy->last_rtgb,
 				sg_policy->last_raw_freq, sg_policy->last_freq,
 				sg_policy->last_flags,
 				(unsigned long long)sg_policy->update_count,
 				(unsigned long long)sg_policy->hispeed_hits,
-				(unsigned long long)sg_policy->pl_hits);
+				(unsigned long long)sg_policy->pl_hits,
+				(unsigned long long)sg_policy->nl_hits);
 	}
 
 	return len;
@@ -1041,6 +1027,7 @@ static struct attribute *sugov_attributes[] = {
 	&adaptive_high_freq.attr,
 	&target_load_thresh.attr,
 	&target_load_shift.attr,
+	&rtg_boost_freq.attr,
 	&pl.attr,
 	&boost.attr,
 	&decision.attr,
@@ -1200,6 +1187,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 
 	tunables->hispeed_load = WALT_DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_freq = 0;
+	tunables->rtg_boost_freq = 0;
 	tunables->adaptive_low_freq = 0;
 	tunables->adaptive_high_freq = 0;
 	tunables->target_load_thresh = WALT_DEFAULT_TARGET_LOAD_THRESH;
@@ -1281,20 +1269,15 @@ static int sugov_start(struct cpufreq_policy *policy)
 		memset(sg_cpu, 0, sizeof(*sg_cpu));
 		sg_cpu->cpu = cpu;
 		sg_cpu->sg_policy = sg_policy;
-		sg_cpu->flags = SCHED_CPUFREQ_DL;
-		sg_cpu->iowait_boost_max = capacity_orig_of(cpu);
-		sg_cpu->min_boost =
-			(SCHED_CAPACITY_SCALE * policy->cpuinfo.min_freq) /
-			policy->cpuinfo.max_freq;
 	}
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
 
-		cpufreq_add_update_util_hook(cpu, &sg_cpu->update_util,
-					     policy_is_shared(policy) ?
-							sugov_update_shared :
-							sugov_update_single);
+		waltgov_add_callback(cpu, &sg_cpu->cb,
+				     policy_is_shared(policy) ?
+						waltgov_update_freq_shared :
+						waltgov_update_freq_single);
 	}
 	return 0;
 }
@@ -1305,7 +1288,7 @@ static void sugov_stop(struct cpufreq_policy *policy)
 	unsigned int cpu;
 
 	for_each_cpu(cpu, policy->cpus)
-		cpufreq_remove_update_util_hook(cpu);
+		waltgov_remove_callback(cpu);
 
 	synchronize_sched();
 

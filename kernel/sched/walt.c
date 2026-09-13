@@ -21,6 +21,7 @@
 
 #include <linux/acpi.h>
 #include <linux/syscore_ops.h>
+#include <linux/timekeeping.h>
 #include <trace/events/sched.h>
 #include "sched.h"
 #include "walt.h"
@@ -119,9 +120,17 @@ walt_fixup_cumulative_runnable_avg(struct rq *rq,
 
 u64 walt_ktime_clock(void)
 {
-	if (unlikely(walt_ktime_suspended))
+	/*
+	 * Return the last observed timestamp while the system is suspended
+	 * (or while timekeeping is already suspended, which happens when MTK's
+	 * s2idle path nests syscore_suspend inside a suspend): reading the
+	 * clock there trips ktime_get()'s WARN_ON(timekeeping_suspended).
+	 */
+	if (unlikely(walt_ktime_suspended || timekeeping_suspended))
 		return ktime_to_ns(ktime_last);
-	return ktime_get_ns();
+
+	ktime_last = ktime_get();
+	return ktime_to_ns(ktime_last);
 }
 
 /*
@@ -173,7 +182,13 @@ static void walt_resume(void)
 
 static int walt_suspend(void)
 {
-	ktime_last = ktime_get();
+	/*
+	 * Do not read the clock here: this syscore callback has been observed
+	 * to run after timekeeping_suspend() on this platform and ktime_get()
+	 * warns once timekeeping is suspended. walt_ktime_clock() keeps
+	 * ktime_last up to date, so the timestamp frozen across suspend is the
+	 * last value observed before it.
+	 */
 	walt_ktime_suspended = true;
 	return 0;
 }

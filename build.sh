@@ -78,7 +78,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     ./kptools -p -i Image.old -k kpimg -o Image
     cp -f Image out/arch/arm64/boot/Image
 
-    rm -rf AnyKernel3
+    rm -rf AnyKernel3 Image Image.old kpimg kptools
 
     git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
     cp out/arch/arm64/boot/Image AnyKernel3/

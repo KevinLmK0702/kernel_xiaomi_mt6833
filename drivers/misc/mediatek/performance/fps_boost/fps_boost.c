@@ -88,6 +88,18 @@ static int  fb_floor_en   = 1;	/* raise the cpufreq floor */
 static int  fb_graded     = 1;	/* scale boost_pct with the fps deficit */
 static int  fb_ged_target = 1;	/* prefer the target fps GED reports */
 
+/* Optional list of the target fps the renderer is known to use, e.g.
+ * "60 90 120".  With two or more entries the control loop matches the band the
+ * app is currently rendering in (preferring the higher band on a tie, so a
+ * drop is still boosted) - that way a game capped at 30 fps is not boosted
+ * forever.  A plain target_fps write clears the list again.
+ */
+#define FB_MAX_TARGETS	4
+static int  fb_targets[FB_MAX_TARGETS];
+static int  fb_ntargets;
+static int  fb_target_idx;
+static int  fb_target_list;		/* proc node binding (write-only) */
+
 #define FB_WARMUP_SAMPLES 8
 
 /* A commit gap longer than this means idle, not a slow frame. */
@@ -109,6 +121,7 @@ static u32  fb_cur_pct;			/* strength currently applied */
 static unsigned long fb_last_jank_jiffies;
 static bool fb_applied;			/* cpufreq floor currently applied */
 static u32  fb_boost_events;
+static u32  fb_capped_events;		/* ceiling left no room for the floor */
 static u64  fb_last_present_ns;
 static u64  fb_last_ged_ns;
 
@@ -159,11 +172,54 @@ static u64 fb_last_activity_ns(void)
 	return max(fb_last_present_ns, fb_last_ged_ns);
 }
 
-/* Target fps to judge against: GED's number when it looks sane and the user
- * asked for it, otherwise the per-app tunable.
+/* Target fps to judge against, in order of preference: the matched band of the
+ * configured target list, the fps GED reports (when sane and enabled), the
+ * single tunable.  @commit lets the control loop store the newly matched band.
  */
-static unsigned int fb_effective_target(void)
+static unsigned int fb_match_target(unsigned int fps, bool commit)
 {
+	int i, best = 0, d_new, d_best;
+	unsigned int cur;
+
+	if (fb_ntargets <= 0)
+		return (unsigned int)fb_target_fps;
+
+	/* stay in the current band while the fps is within +-15 % of it */
+	if (fb_target_idx >= 0 && fb_target_idx < fb_ntargets) {
+		cur = (unsigned int)fb_targets[fb_target_idx];
+		if ((u64)fps * 100 >= (u64)cur * 85 &&
+		    (u64)fps * 100 <= (u64)cur * 115)
+			return cur;
+	}
+
+	/* otherwise move to the nearest band, preferring the higher one on a
+	 * tie: this is a boost driver, aiming high beats settling low
+	 */
+	for (i = 1; i < fb_ntargets; i++) {
+		d_new = fb_targets[i] - (int)fps;
+		d_best = fb_targets[best] - (int)fps;
+		if (d_new < 0)
+			d_new = -d_new;
+		if (d_best < 0)
+			d_best = -d_best;
+		if (d_new <= d_best)
+			best = i;
+	}
+
+	if (commit)
+		fb_target_idx = best;
+
+	return (unsigned int)fb_targets[best];
+}
+
+static unsigned int fb_effective_target(unsigned int fps)
+{
+	if (fb_ntargets >= 2)
+		return fb_match_target(fps, false);
+
+	if (fb_ntargets == 1)
+		return (unsigned int)fb_targets[0];
+
 	if (fb_ged_target && fb_ged_tgt > 0 && fb_ged_tgt <= 300)
 		return (unsigned int)fb_ged_tgt;
 
@@ -303,9 +359,26 @@ static int fb_apply_policy(struct cpufreq_policy *pol, bool on,
 			fb_saved_min[cpu] = pol->user_policy.min;
 		}
 
-		/* never lower what the user asked for */
-		if (want < fb_saved_min[cpu])
-			want = fb_saved_min[cpu];
+		/* Thermal management / perfmgr may have lowered the ceiling in
+		 * the meantime.  cpufreq_set_policy() rejects min > max outright
+		 * (-EINVAL), so clamp to it - and when there is no room left at
+		 * all, drop our floor instead of fighting the thermal limit:
+		 * the ceiling always wins.
+		 */
+		if (pol->max && want > pol->max)
+			want = pol->max;
+
+		if (want <= fb_saved_min[cpu]) {
+			if (fb_boost_floor[cpu]) {
+				if (pol->user_policy.min == fb_boost_floor[cpu])
+					pol->user_policy.min = fb_saved_min[cpu];
+				fb_boost_floor[cpu] = 0;
+				changed = true;
+			}
+			fb_saved_min[cpu] = 0;
+			fb_capped_events++;
+			goto unlock;
+		}
 
 		fb_boost_floor[cpu] = want;
 
@@ -460,13 +533,11 @@ static void fb_apply_actuator(bool on, unsigned int pct)
 /* control loop                                                        */
 static void fb_control(struct work_struct *work)
 {
-	unsigned int target, fps = 0;
+	unsigned int target = 0, fps = 0;
 	bool want = false;
 	bool requeue = true;
 
 	mutex_lock(&fb_lock);
-
-	target = fb_effective_target();
 
 	if (!fb_enable) {
 		fb_boosting = false;
@@ -488,6 +559,11 @@ static void fb_control(struct work_struct *work)
 		int f, tg;
 
 		fps = (unsigned int)(1000000000ULL / fb_ema_interval_ns);
+		/* pick the band the app is actually rendering in and remember
+		 * it for the next tick (see fb_match_target())
+		 */
+		target = (fb_ntargets >= 2) ? fb_match_target(fps, true)
+					    : fb_effective_target(fps);
 		f = (int)fps;
 		tg = (int)target;
 
@@ -524,10 +600,15 @@ static int fb_status_show(struct seq_file *m, void *v)
 {
 	u64 ema = fb_ema_interval_ns;
 	unsigned int fps = ema ? (unsigned int)(1000000000ULL / ema) : 0;
+	int i;
 
 	seq_printf(m, "enable      : %d\n", fb_enable);
 	seq_printf(m, "target_fps  : %d\n", fb_target_fps);
-	seq_printf(m, "eff_target  : %u\n", fb_effective_target());
+	seq_printf(m, "eff_target  : %u\n", fb_effective_target(fps));
+	seq_printf(m, "target_list :");
+	for (i = 0; i < fb_ntargets; i++)
+		seq_printf(m, " %d", fb_targets[i]);
+	seq_printf(m, "%s\n", fb_ntargets ? "" : " (none)");
 	seq_printf(m, "ged_target  : %d\n", fb_ged_tgt);
 	seq_printf(m, "ged_target_en: %d\n", fb_ged_target);
 	seq_printf(m, "margin_fps  : %d\n", fb_margin_fps);
@@ -544,10 +625,34 @@ static int fb_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "ged_samples : %u\n", fb_ged_samples);
 	seq_printf(m, "boosting    : %u\n", fb_boosting);
 	seq_printf(m, "boost_events: %u\n", fb_boost_events);
+	seq_printf(m, "capped_event: %u\n", fb_capped_events);
 	seq_printf(m, "rtg_id      : %d\n", fb_rtg_id);
 	seq_printf(m, "rtg_mode    : %d\n", fb_rtg_mode);
 	seq_printf(m, "rtg_set     : %u\n", fb_rtg_attached);
 	seq_printf(m, "rtg_pid     : %d\n", fb_rtg_pid);
+
+	/* read-back of what cpufreq actually holds: min/max are the enforced
+	 * limits, user_min the value we ask for, floor/base our bookkeeping.
+	 * If min != user_min the platform (thermal, perfmgr) refused the write.
+	 */
+	{
+		struct cpufreq_policy *pol;
+		unsigned int cpu;
+
+		for_each_possible_cpu(cpu) {
+			pol = cpufreq_cpu_get(cpu);
+			if (!pol)
+				continue;
+			if (pol->cpu == cpu && cpu < ARRAY_SIZE(fb_saved_min))
+				seq_printf(m,
+					   "policy%u     : min=%u max=%u user_min=%u floor=%u base=%u\n",
+					   cpu, pol->min, pol->max,
+					   pol->user_policy.min,
+					   fb_boost_floor[cpu],
+					   fb_saved_min[cpu]);
+			cpufreq_cpu_put(pol);
+		}
+	}
 	return 0;
 }
 
@@ -582,6 +687,49 @@ static ssize_t fb_node_read(struct file *file, char __user *ubuf,
 	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
 }
 
+/* Parse a whitespace/comma/slash separated list of target fps, e.g.
+ * "60 90 120", "60,90,120".  Empty or invalid input clears the list (back to
+ * the single target_fps / GED behaviour).  Bands are kept sorted ascending and
+ * the highest one becomes the initial match, so an ambiguous start still
+ * prefers boosting.
+ */
+static void fb_parse_targets(char *buf)
+{
+	int n = 0, i, j;
+	char *s = buf;
+
+	while (n < FB_MAX_TARGETS) {
+		char *end;
+		long v;
+
+		while (*s == ' ' || *s == '\t' || *s == ',' || *s == '/')
+			s++;
+		if (!*s)
+			break;
+
+		v = simple_strtol(s, &end, 0);
+		if (end == s)
+			break;
+		if (v > 0 && v <= 300) {
+			/* insertion sort: keep ascending, drop duplicates */
+			for (i = n; i > 0 && fb_targets[i - 1] > (int)v; i--)
+				fb_targets[i] = fb_targets[i - 1];
+			if (i == 0 || fb_targets[i - 1] != (int)v) {
+				fb_targets[i] = (int)v;
+				n++;
+			}
+		}
+		s = end;
+	}
+
+	for (j = n; j < FB_MAX_TARGETS; j++)
+		fb_targets[j] = 0;
+
+	fb_ntargets = n;
+	fb_target_idx = n ? n - 1 : 0;
+	pr_info("[fps_boost] target list: %d band(s)\n", fb_ntargets);
+}
+
 static ssize_t fb_node_write(struct file *file, const char __user *ubuf,
 			     size_t len, loff_t *ppos)
 {
@@ -598,6 +746,18 @@ static ssize_t fb_node_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	kbuf[len] = '\0';
 
+	/* list node: not a plain integer, parse it before kstrtol() */
+	if (p == &fb_target_list) {
+		mutex_lock(&fb_lock);
+		fb_parse_targets(kbuf);
+		mutex_unlock(&fb_lock);
+
+		if (fb_wq)
+			queue_delayed_work(fb_wq, &fb_dwork, 0);
+
+		return len;
+	}
+
 	ret = kstrtol(kbuf, 0, &val);
 	if (ret)
 		return ret;
@@ -607,6 +767,8 @@ static ssize_t fb_node_write(struct file *file, const char __user *ubuf,
 		fb_enable = val ? 1 : 0;
 	} else if (p == &fb_target_fps) {
 		fb_target_fps = clamp_val(val, 1, 300);
+		/* a plain single target supersedes the list */
+		fb_ntargets = 0;
 	} else if (p == &fb_margin_fps) {
 		fb_margin_fps = clamp_val(val, 0, 120);
 	} else if (p == &fb_boost_pct) {
@@ -681,6 +843,8 @@ static int __init fb_init(void)
 			     &fb_node_fops, &fb_enable);
 	e = proc_create_data("target_fps", 0644, fb_proc_root,
 			     &fb_node_fops, &fb_target_fps);
+	e = proc_create_data("target_fps_list", 0644, fb_proc_root,
+			     &fb_node_fops, &fb_target_list);
 	e = proc_create_data("margin_fps", 0644, fb_proc_root,
 			     &fb_node_fops, &fb_margin_fps);
 	e = proc_create_data("boost_pct", 0644, fb_proc_root,

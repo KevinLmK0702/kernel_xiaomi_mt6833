@@ -6310,6 +6310,10 @@ static void sf_cmdq_cb(struct cmdq_cb_data data)
 static int mtk_hdr_color_gain_setted;
 #endif
 
+/* fps_boost: notified once per presented frame (DRM atomic commit). */
+void (*mtk_drm_present_fp)(void);
+EXPORT_SYMBOL(mtk_drm_present_fp);
+
 static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 				      struct drm_crtc_state *old_crtc_state)
 {
@@ -6325,6 +6329,9 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct mtk_cmdq_cb_data *cb_data;
 	struct mtk_ddp_comp *comp;
 	struct mtk_drm_crtc *mtk_crtc0 = to_mtk_crtc(priv->crtc[0]);
+
+	if (mtk_drm_present_fp)
+		mtk_drm_present_fp();
 
 	CRTC_MMP_EVENT_START(index, atomic_flush, (unsigned long)crtc_state,
 			(unsigned long)old_crtc_state);

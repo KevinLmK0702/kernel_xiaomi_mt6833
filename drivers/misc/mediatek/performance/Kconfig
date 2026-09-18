@@ -89,3 +89,17 @@ config MTK_GBE
 	  boost Game Engine while gaming for better gaming experience
 	  This function depends on MTK_FPSGO_V3.
 	  If you are not sure about this, please set n.
+config MTK_FPS_BOOST
+	bool "MTK fps_boost frame-aware CPU boost (experimental)"
+	depends on MTK_FPSGO_V3 && SCHED_WALT
+	default n
+	help
+	  Experimental frame-aware CPU boost: subscribes to the GED-KPI
+	  main-head frame notifier (ged_kpi_fps_notify_fp) and holds a
+	  cpufreq boost when the rendered frame rate drops below
+	  target_fps - margin_fps.  While boosting, the tracked renderer is
+	  also attached to a WALT related-thread-group id so the "walt"
+	  cpufreq governor can raise its target utilisation to
+	  rtg_boost_freq while the group is busy.  Tune/disable at runtime
+	  via /proc/fps_boost/ (rtg_id = 0 turns the WALT coupling off).
+	  If you are not sure, set n.

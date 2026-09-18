@@ -58,6 +58,12 @@ bool ged_kpi_set_gpu_dvfs_hint(int t_gpu_target, int t_gpu_cur);
 void ged_kpi_set_game_hint(int mode);
 unsigned int ged_kpi_enabled(void);
 void ged_kpi_set_target_FPS(u64 ulID, int target_FPS);
+
+extern void (*ged_kpi_fps_notify_fp)(int pid,
+	unsigned long long frame_interval_ns,
+	int target_fps,
+	int target_fps_margin,
+	int is_sf);
 void ged_kpi_set_target_FPS_margin(u64 ulID, int target_FPS,
 	int target_FPS_margin, int cpu_time);
 #ifdef GED_ENABLE_TIMER_BASED_DVFS_MARGIN

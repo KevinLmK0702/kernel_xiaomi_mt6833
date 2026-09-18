@@ -369,6 +369,14 @@ void (*ged_kpi_cpu_boost_check_01)(
 	int ismainhead);
 EXPORT_SYMBOL(ged_kpi_cpu_boost_check_01);
 /* ------------------------------------------------------------------- */
+/* fps_boost: notify per-frame event of the main rendering head */
+void (*ged_kpi_fps_notify_fp)(int pid,
+	unsigned long long frame_interval_ns,
+	int target_fps,
+	int target_fps_margin,
+	int is_sf);
+EXPORT_SYMBOL(ged_kpi_fps_notify_fp);
+/* ------------------------------------------------------------------- */
 void (*ged_kpi_output_gfx_info2_fp)(long long t_gpu, unsigned int cur_freq
 	, unsigned int cur_max_freq, u64 ulID);
 EXPORT_SYMBOL(ged_kpi_output_gfx_info2_fp);
@@ -1442,6 +1450,16 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 			psHead->t_cpu_latest =
 				psKPI->ullTimeStamp1 - psHead->last_TimeStamp1;
 			psKPI->t_cpu = psHead->t_cpu_latest;
+
+			/* fps_boost: report every head frame (with SF flag) so the
+			 * consumer can pick the active renderer by itself.
+			 */
+			if (ged_kpi_fps_notify_fp && psHead)
+				ged_kpi_fps_notify_fp(psHead->pid,
+					(unsigned long long)psHead->t_cpu_latest,
+					psHead->target_fps,
+					psHead->target_fps_margin,
+					psHead->isSF);
 
 			/* hint gpu info to EAT*/
 			ged_log_perf_trace_counter("t_cpu", psKPI->t_cpu,

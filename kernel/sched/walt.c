@@ -99,12 +99,18 @@ static inline void fixup_cum_window_demand(struct rq *rq, s64 delta)
 #define RTG_BOOST_DEMAND_PCT	50
 
 struct walt_related_thread_group {
-	int		id;
 	atomic64_t	load;
 };
 
+/*
+ * Statically allocated on purpose: a group id is looked up from the very
+ * first enqueue (i.e. before any late_initcall runs), and a failed dynamic
+ * allocation would leave NULL entries behind that every accessor - including
+ * the governor's rtgb_active() on a hot path - would have to check.
+ */
 static struct walt_related_thread_group
-		*related_thread_groups[MAX_NUM_CGROUP_COLOC_ID];
+		related_thread_groups[MAX_NUM_CGROUP_COLOC_ID];
+
 static atomic64_t walt_rtg_total_load = ATOMIC64_INIT(0);
 
 static inline struct walt_related_thread_group *
@@ -113,7 +119,7 @@ walt_lookup_group(unsigned int id)
 	if (id == 0 || id >= MAX_NUM_CGROUP_COLOC_ID)
 		return NULL;
 
-	return related_thread_groups[id];
+	return &related_thread_groups[id];
 }
 
 /* Account a change of @p's demand against its related thread group */
@@ -134,7 +140,6 @@ static void walt_grp_load_add(struct task_struct *p, s64 delta)
 
 static bool walt_rtgb_active(void)
 {
-	struct walt_related_thread_group *grp;
 	u64 threshold;
 	int i;
 
@@ -151,8 +156,8 @@ static bool walt_rtgb_active(void)
 		return false;
 
 	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
-		grp = related_thread_groups[i];
-		if (grp && atomic64_read(&grp->load) >= (s64)threshold)
+		if (atomic64_read(&related_thread_groups[i].load) >=
+		    (s64)threshold)
 			return true;
 	}
 
@@ -206,7 +211,7 @@ static int rtg_show(struct seq_file *s, void *unused)
 	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++)
 		seq_printf(s, "group%d load=%lld\n", i,
 			   (long long)atomic64_read(
-					&related_thread_groups[i]->load));
+					&related_thread_groups[i].load));
 
 	return 0;
 }
@@ -264,25 +269,6 @@ static int __init walt_rtg_debugfs_init(void)
 }
 late_initcall(walt_rtg_debugfs_init);
 #endif /* CONFIG_DEBUG_FS */
-
-static int __init walt_rtg_init(void)
-{
-	int i;
-
-	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
-		related_thread_groups[i] =
-			kzalloc(sizeof(struct walt_related_thread_group),
-				GFP_KERNEL);
-		if (!related_thread_groups[i])
-			return -ENOMEM;
-
-		related_thread_groups[i]->id = i;
-		atomic64_set(&related_thread_groups[i]->load, 0);
-	}
-
-	return 0;
-}
-late_initcall(walt_rtg_init);
 
 void
 walt_inc_cumulative_runnable_avg(struct rq *rq,
@@ -409,52 +395,42 @@ void waltgov_run_callback(struct rq *rq, unsigned int flags)
 }
 
 /*
- * WALT based CPU utilization for the "walt" cpufreq governor. Mirrors
- * cpu_util_freq() in fair.c but additionally reports the WALT load info
- * the Qualcomm walt governor consumes (nl/pl/rtgb_active/ws).
+ * Extra WALT load information for the "walt" cpufreq governor, ported from
+ * Qualcomm's walt_cpu_load: the new task load (nl), the predictive demand sum
+ * (pl), the related thread group state and the window start.
  *
- * nl (new task load) comes from the new task runnable sums, pl from the
- * predictive demand sum and rtgb_active from the related thread group load
- * tracker (see the reduced RTG port above).
+ * The utilization itself is deliberately *not* returned here. The governor
+ * reads it through boosted_cpu_util(), exactly like the platform's schedutil
+ * governor does, so that the schedtune boost of the foreground cgroup is
+ * honoured; a raw WALT sum would make every foreground workload look lighter
+ * than the platform asked for.
  */
-unsigned long cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load)
+void waltgov_cpu_load(int cpu, struct walt_cpu_load *walt_load)
 {
 	struct rq *rq = cpu_rq(cpu);
-	u64 util;
+	u64 util, pl, nl;
 
-	if (walt_load) {
-		walt_load->nl = 0;
-		walt_load->pl = 0;
-		walt_load->rtgb_active = false;
-		walt_load->ws = 0;
-	}
+	memset(walt_load, 0, sizeof(*walt_load));
 
-	if (likely(!walt_disabled && sysctl_sched_use_walt_cpu_util)) {
-		util = rq->prev_runnable_sum;
-		util <<= SCHED_CAPACITY_SHIFT;
-		do_div(util, walt_ravg_window);
+	if (unlikely(walt_disabled || !sysctl_sched_use_walt_cpu_util))
+		return;
 
-		if (walt_load) {
-			u64 pl = rq->pred_demands_sum;
-			u64 nl = rq->nt_prev_runnable_sum;
+	util = rq->prev_runnable_sum;
+	util <<= SCHED_CAPACITY_SHIFT;
+	do_div(util, walt_ravg_window);
 
-			pl <<= SCHED_CAPACITY_SHIFT;
-			do_div(pl, walt_ravg_window);
-			walt_load->pl = (unsigned long)pl;
+	pl = rq->pred_demands_sum;
+	pl <<= SCHED_CAPACITY_SHIFT;
+	do_div(pl, walt_ravg_window);
+	walt_load->pl = (unsigned long)pl;
 
-			nl <<= SCHED_CAPACITY_SHIFT;
-			do_div(nl, walt_ravg_window);
-			walt_load->nl = min_t(u64, nl, util);
+	nl = rq->nt_prev_runnable_sum;
+	nl <<= SCHED_CAPACITY_SHIFT;
+	do_div(nl, walt_ravg_window);
+	walt_load->nl = min_t(u64, nl, util);
 
-			walt_load->rtgb_active = walt_rtgb_active();
-			walt_load->ws = rq->window_start;
-		}
-	} else {
-		util = READ_ONCE(rq->cfs.avg.util_avg);
-		util += READ_ONCE(rq->rt.avg.util_avg);
-	}
-
-	return min_t(unsigned long, util, capacity_orig_of(cpu));
+	walt_load->rtgb_active = walt_rtgb_active();
+	walt_load->ws = rq->window_start;
 }
 
 static void walt_resume(void)

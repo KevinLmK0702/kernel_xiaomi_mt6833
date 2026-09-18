@@ -128,7 +128,7 @@ struct sugov_cpu {
 	unsigned long max;
 	unsigned int flags;
 
-	/* WALT load info collected by cpu_util_freq_walt() */
+	/* WALT load info filled by waltgov_cpu_load() */
 	struct walt_cpu_load walt_load;
 
 	/* The field below is for single-CPU policies only. */
@@ -543,10 +543,18 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long *util,
 
 	max_cap = arch_scale_cpu_capacity(NULL, sg_cpu->cpu);
 
-	if (likely(!walt_disabled && sysctl_sched_use_walt_cpu_util))
-		*util = cpu_util_freq_walt(sg_cpu->cpu, &sg_cpu->walt_load);
-	else
-		*util = boosted_cpu_util(sg_cpu->cpu);
+	/*
+	 * Read the utilization the way the stock schedutil governor of this
+	 * kernel does - boosted_cpu_util() adds schedtune's boost for the
+	 * foreground cgroup on top of the WALT/PELT utilization. Taking the raw
+	 * WALT sum instead (as the original Qualcomm governor can, because it
+	 * has no schedtune) lost that boost and made every boosted workload look
+	 * lighter than the platform asked for.
+	 */
+	*util = boosted_cpu_util(sg_cpu->cpu);
+
+	/* WALT's own load signals: nl, pl, running related thread group */
+	waltgov_cpu_load(sg_cpu->cpu, &sg_cpu->walt_load);
 
 	if (idle_cpu(sg_cpu->cpu))
 		*util = 0;
@@ -614,7 +622,13 @@ static void waltgov_update_freq_single(struct waltgov_callback *cb, u64 time,
 	 */
 	raw_spin_lock(&sg_policy->update_lock);
 
-	walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws, policy->cur);
+	/*
+	 * The average capacity only makes sense once a WALT window is known;
+	 * without one (WALT utilization disabled by sysctl) an update would
+	 * only reset the tracker with a bogus window and leave avg_cap stale.
+	 */
+	if (sg_cpu->walt_load.ws)
+		walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws, policy->cur);
 	walt_adjust_util(sg_cpu, util, &util, &max);
 	next_f = walt_get_next_freq(sg_policy, util, max, sg_cpu->cpu);
 	waltgov_trace_decision(sg_policy, sg_cpu->cpu, util, max, next_f,
@@ -698,8 +712,9 @@ static void waltgov_update_freq_shared(struct waltgov_callback *cb, u64 time,
 	sg_cpu->last_update = time;
 
 	if (sugov_should_update_freq(sg_policy, time)) {
-		walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
-				  sg_policy->policy->cur);
+		if (sg_cpu->walt_load.ws)
+			walt_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
+					  sg_policy->policy->cur);
 		next_f = sugov_next_freq_shared(sg_cpu, time);
 
 		sugov_update_commit(sg_policy, time, next_f);

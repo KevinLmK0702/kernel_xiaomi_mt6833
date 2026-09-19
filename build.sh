@@ -28,6 +28,10 @@ CLANG_LIB="$TC_DIR/Clang-16.0/lib/"
 DATE_STR=$(date +'%y%m%d')
 KER_STR="Evergo and Everpal Kernel, compiled on $DATE_STR"
 
+NAME_STR="AnyKernel3-evergo-ReSukiSU-4.2.0"
+ZIP_KP="$NAME_STR-KPN-EXP-$DATE_STR.zip"
+ZIP_VANILLA="$NAME_STR-vanilla-$DATE_STR.zip"
+
 export PATH="$CLANG_DIR:$PATH"
 export LD_LIBRARY_PATH="$CLANG_LIB":$LD_LIBRARY_PATH
 export ARCH=arm64
@@ -71,9 +75,12 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     ls -lh "out/arch/arm64/boot/Image.gz"
     file "out/arch/arm64/boot/Image.gz"
 
+    cp out/arch/arm64/boot/Image Image.vanilla
+
     wget -O kpimg https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.13/kpimg-linux
     wget -O kptools https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.13/kptools-linux
     chmod 777 kpimg kptools
+
     cp out/arch/arm64/boot/Image Image.old
     ./kptools -p -i Image.old -k kpimg -o Image
     cp -f Image out/arch/arm64/boot/Image
@@ -82,21 +89,26 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
     cp out/arch/arm64/boot/Image AnyKernel3/
-    rm -rf AnyKernel3-evergo-ReSukiSU-4.2.0-*.zip
+    rm -rf "$NAME_STR"-*.zip
     cd AnyKernel3
 
     sed -i 's/device\.name1=.*/device.name1=evergo/' anykernel.sh
     sed -i 's/device\.name2=.*/device.name2=everpal/' anykernel.sh
     sed -i '/device\.name[3-5]=.*/d' anykernel.sh
 
-    sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
-
     sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
     sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
 
-    zip -r ../AnyKernel3-evergo-ReSukiSU-4.2.0-$DATE_STR.zip *
+    sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
 
-    cd ..  
+    zip -r "../$ZIP_KP" *
+
+    cp -f ../Image.vanilla Image
+    zip -r "../$ZIP_VANILLA" *
+
+    rm -f ../Image.vanilla
+
+    cd ..
     print_info "内核打包完成, 文件输出: "
     ls -la AnyKernel3-*
 

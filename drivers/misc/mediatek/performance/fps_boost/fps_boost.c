@@ -62,6 +62,16 @@ extern void (*ged_kpi_fps_notify_fp)(int pid,
 
 extern void (*mtk_drm_present_fp)(void);
 
+/*
+ * Handlers that were installed before us.  Both hooks are single-slot plain
+ * function pointers, so we chain instead of clobbering: MTK's own FPSGO /
+ * perfmgr stack may already listen on the GED notifier, and dropping it would
+ * silently disable frame awareness elsewhere.
+ */
+static void (*fb_prev_ged_fp)(int pid, unsigned long long frame_interval_ns,
+			      int target_fps, int target_fps_margin, int is_sf);
+static void (*fb_prev_drm_fp)(void);
+
 /* WALT coupling (ported "walt" scheduler stack): the renderer is attached to
  * a related-thread-group id; the governor reacts to the group's load.
  */
@@ -79,6 +89,11 @@ static int  fb_boost_pct  = 60;	/* base strength: % of the cluster max */
 static int  fb_hold_ms    = 250;	/* keep boosting at least this long */
 static int  fb_sample_ms  = 200;	/* control loop period */
 static int  fb_rtg_id     = 1;	/* WALT RTG id for the renderer, 0 = off */
+/* Explicit renderer pid for the RTG actuator; 0 = follow the pid GED reports.
+ * Needed on setups whose frame source is the display path only - that path
+ * carries no pid, so without this the WALT RTG boost could never be engaged.
+ */
+static int  fb_rtg_pid_user;
 /* RTG attach policy: 0 = off, 1 = only while boosting, 2 = whenever the
  * renderer is tracked (the group's own load then decides if the governor
  * acts at all - no attach/detach churn when the boost toggles).
@@ -122,6 +137,7 @@ static unsigned long fb_last_jank_jiffies;
 static bool fb_applied;			/* cpufreq floor currently applied */
 static u32  fb_boost_events;
 static u32  fb_capped_events;		/* ceiling left no room for the floor */
+static u32  fb_foreign_events;		/* someone else moved the floor under us */
 static u64  fb_last_present_ns;
 static u64  fb_last_ged_ns;
 
@@ -256,13 +272,13 @@ static void fb_frame_notify(int pid, unsigned long long interval_ns,
 	u64 now;
 
 	if (!fb_enable)
-		return;
+		goto chain;
 
 	if (fb_all_samples < 0xffffffffU)
 		fb_all_samples++;
 
 	if (is_sf)
-		return;
+		goto chain;
 
 	if (target_fps > 0 && target_fps <= 300)
 		fb_ged_tgt = target_fps;
@@ -286,6 +302,11 @@ static void fb_frame_notify(int pid, unsigned long long interval_ns,
 
 	fb_last_ged_ns = now;
 	(void)target_fps_margin;
+
+chain:
+	if (fb_prev_ged_fp)
+		fb_prev_ged_fp(pid, interval_ns, target_fps,
+			       target_fps_margin, is_sf);
 }
 
 /* Display present notifier: called once per DRM atomic commit, i.e. per frame
@@ -295,24 +316,27 @@ static void fb_present_notify(void)
 {
 	u64 now, gap;
 
-	if (!fb_enable)
-		return;
-
-	/* ktime_get_mono_fast_ns(): plain clocksource read, no seqcount retry
-	 * loop - this runs once per presented frame.
-	 */
-	now = ktime_get_mono_fast_ns();
-	if (fb_last_present_ns && now > fb_last_present_ns) {
-		gap = now - fb_last_present_ns;
-		/* feed the EMA only for active rendering; idle gaps would
-		 * drag the measured fps down and keep the boost on forever
+	if (fb_enable) {
+		/* ktime_get_mono_fast_ns(): plain clocksource read, no seqcount
+		 * retry loop - this runs once per presented frame.
 		 */
-		if (gap <= FB_PRESENT_MAX_GAP_NS)
-			fb_note_interval(gap);
-	} else {
-		fb_note_interval(0ULL);
+		now = ktime_get_mono_fast_ns();
+		if (fb_last_present_ns && now > fb_last_present_ns) {
+			gap = now - fb_last_present_ns;
+			/* feed the EMA only for active rendering; idle gaps would
+			 * drag the measured fps down and keep the boost on forever
+			 */
+			if (gap <= FB_PRESENT_MAX_GAP_NS)
+				fb_note_interval(gap);
+		} else {
+			fb_note_interval(0ULL);
+		}
+		fb_last_present_ns = now;
 	}
-	fb_last_present_ns = now;
+
+	/* always forward, even while disabled */
+	if (fb_prev_drm_fp)
+		fb_prev_drm_fp();
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,10 +377,12 @@ static int fb_apply_policy(struct cpufreq_policy *pol, bool on,
 			/* first tick of this boost: remember the base */
 			fb_saved_min[cpu] = pol->user_policy.min;
 		} else if (pol->user_policy.min != fb_boost_floor[cpu]) {
-			/* someone (sysfs, thermal) moved the floor while we
-			 * were boosting: adopt it as the new base
+			/* someone (sysfs, thermal, perfmgr/FPSGO) moved the
+			 * floor while we were boosting: adopt it as the new base
+			 * and count it, so the interaction is visible in status
 			 */
 			fb_saved_min[cpu] = pol->user_policy.min;
+			fb_foreign_events++;
 		}
 
 		/* Thermal management / perfmgr may have lowered the ceiling in
@@ -428,9 +454,17 @@ static struct task_struct *fb_find_task(int pid)
 	return task;
 }
 
+/* PID the RTG actuator works on: the explicit override when set, otherwise the
+ * renderer GED reported.
+ */
+static int fb_rtg_target_pid(void)
+{
+	return fb_rtg_pid_user > 0 ? fb_rtg_pid_user : fb_pid;
+}
+
 static int fb_rtg_desired(bool boosting)
 {
-	if (!fb_rtg_id || fb_pid <= 0 || !fb_enable)
+	if (!fb_rtg_id || fb_rtg_target_pid() <= 0 || !fb_enable)
 		return 0;
 
 	if (fb_rtg_mode == 2)
@@ -465,6 +499,7 @@ static void fb_rtg_detach(void)
 static void fb_apply_rtg(bool boosting)
 {
 	struct task_struct *task;
+	int pid = fb_rtg_target_pid();
 	int want = fb_rtg_desired(boosting);
 
 	if (!want) {
@@ -473,21 +508,20 @@ static void fb_apply_rtg(bool boosting)
 	}
 
 	if (fb_rtg_attached) {
-		if (fb_rtg_pid == fb_pid && fb_rtg_cur_id == want)
+		if (fb_rtg_pid == pid && fb_rtg_cur_id == want)
 			return;	/* membership already correct */
 		fb_rtg_detach();
 	}
 
-	task = fb_find_task(fb_pid);
+	task = fb_find_task(pid);
 	if (!task) {
-		pr_info_ratelimited("[fps_boost] rtg: pid %d not found\n",
-				    fb_pid);
+		pr_info_ratelimited("[fps_boost] rtg: pid %d not found\n", pid);
 		return;
 	}
 
 	if (!sched_set_group_id(task, (unsigned int)want)) {
 		fb_rtg_attached = true;
-		fb_rtg_pid = fb_pid;
+		fb_rtg_pid = pid;
 		fb_rtg_cur_id = want;
 		pr_info_ratelimited("[fps_boost] rtg: pid %d -> group %d\n",
 				    fb_rtg_pid, fb_rtg_cur_id);
@@ -626,10 +660,12 @@ static int fb_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "boosting    : %u\n", fb_boosting);
 	seq_printf(m, "boost_events: %u\n", fb_boost_events);
 	seq_printf(m, "capped_event: %u\n", fb_capped_events);
+	seq_printf(m, "foreign_evt : %u\n", fb_foreign_events);
 	seq_printf(m, "rtg_id      : %d\n", fb_rtg_id);
 	seq_printf(m, "rtg_mode    : %d\n", fb_rtg_mode);
 	seq_printf(m, "rtg_set     : %u\n", fb_rtg_attached);
 	seq_printf(m, "rtg_pid     : %d\n", fb_rtg_pid);
+	seq_printf(m, "rtg_pid_user: %d\n", fb_rtg_pid_user);
 
 	/* read-back of what cpufreq actually holds: min/max are the enforced
 	 * limits, user_min the value we ask for, floor/base our bookkeeping.
@@ -787,6 +823,10 @@ static ssize_t fb_node_write(struct file *file, const char __user *ubuf,
 		fb_graded = val ? 1 : 0;
 	} else if (p == &fb_ged_target) {
 		fb_ged_target = val ? 1 : 0;
+	} else if (p == &fb_rtg_pid_user) {
+		/* explicit renderer pid; 0 falls back to the GED-reported pid */
+		fb_rtg_pid_user = (val > 0) ?
+			(int)min_t(long, val, INT_MAX) : 0;
 	} else {
 		*p = (int)val;
 	}
@@ -857,6 +897,8 @@ static int __init fb_init(void)
 			     &fb_node_fops, &fb_rtg_id);
 	e = proc_create_data("rtg_mode", 0644, fb_proc_root,
 			     &fb_node_fops, &fb_rtg_mode);
+	e = proc_create_data("rtg_pid", 0644, fb_proc_root,
+			     &fb_node_fops, &fb_rtg_pid_user);
 	e = proc_create_data("floor_en", 0644, fb_proc_root,
 			     &fb_node_fops, &fb_floor_en);
 	e = proc_create_data("graded", 0644, fb_proc_root,
@@ -866,7 +908,12 @@ static int __init fb_init(void)
 	if (!e)
 		pr_warn("[fps_boost] proc node creation incomplete\n");
 
-	/* subscribe to frame notifiers (display present is the primary source) */
+	/* Subscribe to the frame notifiers (display present is the primary
+	 * source).  Remember what was installed before us and chain to it, so
+	 * an earlier listener (MTK's perfmgr/FPSGO stack) keeps working.
+	 */
+	fb_prev_ged_fp = ged_kpi_fps_notify_fp;
+	fb_prev_drm_fp = mtk_drm_present_fp;
 	ged_kpi_fps_notify_fp = fb_frame_notify;
 	mtk_drm_present_fp = fb_present_notify;
 
@@ -881,10 +928,13 @@ static void __exit fb_exit(void)
 	cancel_delayed_work_sync(&fb_dwork);
 
 	mutex_lock(&fb_lock);
+	/* Hand the hooks back to whoever owned them before us, and only if we are
+	 * still the active handler.
+	 */
 	if (ged_kpi_fps_notify_fp == fb_frame_notify)
-		ged_kpi_fps_notify_fp = NULL;
+		ged_kpi_fps_notify_fp = fb_prev_ged_fp;
 	if (mtk_drm_present_fp == fb_present_notify)
-		mtk_drm_present_fp = NULL;
+		mtk_drm_present_fp = fb_prev_drm_fp;
 	fb_enable = 0;
 	fb_boosting = false;
 	mutex_unlock(&fb_lock);
@@ -892,8 +942,26 @@ static void __exit fb_exit(void)
 	fb_apply_actuator(false, (unsigned int)fb_boost_pct);
 	destroy_workqueue(fb_wq);
 
-	if (fb_proc_root)
+	if (fb_proc_root) {
+		/* remove_proc_entry() refuses to drop a non-empty directory, so
+		 * the children have to go first.
+		 */
+		remove_proc_entry("status", fb_proc_root);
+		remove_proc_entry("enable", fb_proc_root);
+		remove_proc_entry("target_fps", fb_proc_root);
+		remove_proc_entry("target_fps_list", fb_proc_root);
+		remove_proc_entry("margin_fps", fb_proc_root);
+		remove_proc_entry("boost_pct", fb_proc_root);
+		remove_proc_entry("hold_ms", fb_proc_root);
+		remove_proc_entry("sample_ms", fb_proc_root);
+		remove_proc_entry("rtg_id", fb_proc_root);
+		remove_proc_entry("rtg_mode", fb_proc_root);
+		remove_proc_entry("rtg_pid", fb_proc_root);
+		remove_proc_entry("floor_en", fb_proc_root);
+		remove_proc_entry("graded", fb_proc_root);
+		remove_proc_entry("ged_target", fb_proc_root);
 		remove_proc_entry(FPS_BOOST_PROC_DIR, NULL);
+	}
 }
 
 module_init(fb_init);

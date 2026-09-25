@@ -113,6 +113,17 @@ static struct walt_related_thread_group
 
 static atomic64_t walt_rtg_total_load = ATOMIC64_INIT(0);
 
+/*
+ * Per-CPU view of the same accounting: the demand a related thread group
+ * contributes to one runqueue.  The governor must only raise the frequency of
+ * the CPUs a group actually loads, so rtgb_active() is evaluated per CPU (see
+ * walt_rtgb_active()) instead of once for the whole system - a globally
+ * active group used to push every cluster at the same time.
+ *
+ * Statically allocated for the same reason as related_thread_groups[].
+ */
+static atomic64_t rtg_cpu_load[NR_CPUS][MAX_NUM_CGROUP_COLOC_ID];
+
 static inline struct walt_related_thread_group *
 walt_lookup_group(unsigned int id)
 {
@@ -123,9 +134,10 @@ walt_lookup_group(unsigned int id)
 }
 
 /* Account a change of @p's demand against its related thread group */
-static void walt_grp_load_add(struct task_struct *p, s64 delta)
+static void walt_grp_load_add(struct rq *rq, struct task_struct *p, s64 delta)
 {
 	struct walt_related_thread_group *grp;
+	int cpu;
 
 	if (!delta)
 		return;
@@ -136,28 +148,46 @@ static void walt_grp_load_add(struct task_struct *p, s64 delta)
 
 	atomic64_add(delta, &grp->load);
 	atomic64_add(delta, &walt_rtg_total_load);
+
+	/*
+	 * @rq is the runqueue @p is (or is about to be) queued on.  Every sched
+	 * class calls the inc/dec helpers symmetrically on enqueue/dequeue, and
+	 * migration goes through deactivate/activate, so the per-CPU view stays
+	 * balanced without extra bookkeeping.
+	 */
+	cpu = rq->cpu;
+	if (cpu >= 0 && cpu < nr_cpu_ids)
+		atomic64_add(delta, &rtg_cpu_load[cpu][p->ravg.grp_id]);
 }
 
-static bool walt_rtgb_active(void)
+/*
+ * Is any related thread group loading @cpu enough to ask the walt governor
+ * for rtg_boost_freq?  @cpu's own capacity is the yardstick, so "active"
+ * means "the group occupies at least RTG_BOOST_DEMAND_PCT of this CPU":
+ * small enough that any real workload triggers the boost, large enough that
+ * an idle group does not.
+ */
+static bool walt_rtgb_active(int cpu)
 {
 	u64 threshold;
 	int i;
 
-	/*
-	 * Demand of a fully busy least capable CPU, scaled by
-	 * RTG_BOOST_DEMAND_PCT: small enough that any real workload triggers
-	 * the boost, large enough that an idle group does not.
-	 */
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		return false;
+
 	threshold = mult_frac((u64)walt_ravg_window,
-			      capacity_orig_of(0) * RTG_BOOST_DEMAND_PCT,
+			      capacity_orig_of(cpu) * RTG_BOOST_DEMAND_PCT,
 			      SCHED_CAPACITY_SCALE * 100);
 
+	/*
+	 * Cheap global pre-filter: the per-CPU loads are a subset of the total,
+	 * so if the total is below the threshold no CPU can be active.
+	 */
 	if (atomic64_read(&walt_rtg_total_load) < (s64)threshold)
 		return false;
 
 	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
-		if (atomic64_read(&related_thread_groups[i].load) >=
-		    (s64)threshold)
+		if (atomic64_read(&rtg_cpu_load[cpu][i]) >= (s64)threshold)
 			return true;
 	}
 
@@ -179,12 +209,12 @@ int sched_set_group_id(struct task_struct *p, unsigned int group_id)
 
 	rq = __task_rq_lock(p, &rf);
 	if (task_on_rq_queued(p))
-		walt_grp_load_add(p, -(s64)p->ravg.demand);
+		walt_grp_load_add(rq, p, -(s64)p->ravg.demand);
 
 	p->ravg.grp_id = group_id;
 
 	if (task_on_rq_queued(p))
-		walt_grp_load_add(p, p->ravg.demand);
+		walt_grp_load_add(rq, p, p->ravg.demand);
 	__task_rq_unlock(rq, &rf);
 
 	raw_spin_unlock_irq(&p->pi_lock);
@@ -202,16 +232,28 @@ EXPORT_SYMBOL(sched_get_group_id);
 #ifdef CONFIG_DEBUG_FS
 static int rtg_show(struct seq_file *s, void *unused)
 {
-	int i;
+	int i, cpu;
 
-	seq_printf(s, "total_load=%lld active=%d\n",
-		   (long long)atomic64_read(&walt_rtg_total_load),
-		   walt_rtgb_active());
+	seq_printf(s, "total_load=%lld\n",
+		   (long long)atomic64_read(&walt_rtg_total_load));
 
-	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++)
-		seq_printf(s, "group%d load=%lld\n", i,
+	seq_printf(s, "active_cpus=");
+	for_each_possible_cpu(cpu) {
+		if (walt_rtgb_active(cpu))
+			seq_printf(s, "%d ", cpu);
+	}
+	seq_printf(s, "\n");
+
+	for (i = 1; i < MAX_NUM_CGROUP_COLOC_ID; i++) {
+		seq_printf(s, "group%d load=%lld cpu_load=", i,
 			   (long long)atomic64_read(
 					&related_thread_groups[i].load));
+		for_each_possible_cpu(cpu)
+			seq_printf(s, "%d:%lld ", cpu,
+				   (long long)atomic64_read(
+						&rtg_cpu_load[cpu][i]));
+		seq_printf(s, "\n");
+	}
 
 	return 0;
 }
@@ -276,7 +318,7 @@ walt_inc_cumulative_runnable_avg(struct rq *rq,
 {
 	rq->cumulative_runnable_avg += p->ravg.demand;
 	rq->pred_demands_sum += p->ravg.pred_demand;
-	walt_grp_load_add(p, (s64)p->ravg.demand);
+	walt_grp_load_add(rq, p, (s64)p->ravg.demand);
 
 	/*
 	 * Add a task's contribution to the cumulative window demand when
@@ -300,7 +342,7 @@ walt_dec_cumulative_runnable_avg(struct rq *rq,
 	if ((s64)rq->pred_demands_sum < 0)
 		rq->pred_demands_sum = 0;
 
-	walt_grp_load_add(p, -(s64)p->ravg.demand);
+	walt_grp_load_add(rq, p, -(s64)p->ravg.demand);
 
 	/*
 	 * on_rq will be 1 for sleeping tasks. So check if the task
@@ -322,7 +364,7 @@ walt_fixup_cumulative_runnable_avg(struct rq *rq,
 		panic("cra less than zero: tld: %lld, task_load(p) = %u\n",
 			task_load_delta, task_load(p));
 
-	walt_grp_load_add(p, task_load_delta);
+	walt_grp_load_add(rq, p, task_load_delta);
 
 	fixup_cum_window_demand(rq, task_load_delta);
 }
@@ -412,7 +454,18 @@ void waltgov_cpu_load(int cpu, struct walt_cpu_load *walt_load)
 
 	memset(walt_load, 0, sizeof(*walt_load));
 
-	if (unlikely(walt_disabled || !sysctl_sched_use_walt_cpu_util))
+	if (unlikely(walt_disabled))
+		return;
+
+	/*
+	 * The RTG boost is independent of sysctl_sched_use_walt_cpu_util: that
+	 * knob only decides whether the *scheduler* takes its placement
+	 * decisions from WALT, while a loaded related thread group still wants
+	 * its CPUs pushed.
+	 */
+	walt_load->rtgb_active = walt_rtgb_active(cpu);
+
+	if (!sysctl_sched_use_walt_cpu_util)
 		return;
 
 	util = rq->prev_runnable_sum;
@@ -429,7 +482,6 @@ void waltgov_cpu_load(int cpu, struct walt_cpu_load *walt_load)
 	do_div(nl, walt_ravg_window);
 	walt_load->nl = min_t(u64, nl, util);
 
-	walt_load->rtgb_active = walt_rtgb_active();
 	walt_load->ws = rq->window_start;
 }
 

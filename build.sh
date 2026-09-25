@@ -26,7 +26,7 @@ CLANG_DIR="$TC_DIR/Clang-16.0/bin/"
 CLANG_LIB="$TC_DIR/Clang-16.0/lib/"
 
 DATE_STR=$(date +'%y%m%d')
-KER_STR="Evergo and Everpal Kernel, compiled on $DATE_STR"
+KER_STR="Evergo and Everpal Kernel, patched ReSukiSU v4.2.0 and SUSFS v2.3.0, compiled on $DATE_STR"
 
 export PATH="$CLANG_DIR:$PATH"
 export LD_LIBRARY_PATH="$CLANG_LIB":$LD_LIBRARY_PATH
@@ -84,11 +84,11 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
 
-    zip -r "../Mix-Kernel-Vanilla-$DATE_STR.zip" *
+    zip -r "../Mix-Kernel-ReSukiSU-v4.2.0-SUSFS-v2.3.0-$DATE_STR.zip" *
 
     cd ..  
     print_info "内核打包完成, 文件输出: "
-    ls -la AnyKernel3-*
+    ls -la Mix-Kernel-* 
 
 else
     print_error "内核编译失败!"

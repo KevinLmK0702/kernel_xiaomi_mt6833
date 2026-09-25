@@ -40,6 +40,10 @@ export O=out
 rm -rf out/ && mkdir out
 rm -rf build_kernel.log
 
+print_info "更新 ReSukiSU..."
+
+curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash 
+
 print_info "配置内核..."
 
 make -j$(nproc --all) O=out \

@@ -88,7 +88,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     cd ..  
     print_info "内核打包完成, 文件输出: "
-    ls -la AnyKernel3-*
+    ls -la Mix-Kernel-*.zip
 
 else
     print_error "内核编译失败!"

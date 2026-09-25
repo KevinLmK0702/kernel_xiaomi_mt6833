@@ -66,6 +66,12 @@ struct sugov_tunables {
 	unsigned int target_load_shift;
 	bool pl;
 	int boost;
+	/*
+	 * When set, a hispeed_freq / rtg_boost_freq of 0 means "use the
+	 * per-cluster default" (see walt_hispeed_freq()); clearing it makes 0
+	 * mean "disabled" again.
+	 */
+	bool auto_boost;
 };
 
 struct sugov_policy {
@@ -87,6 +93,14 @@ struct sugov_policy {
 	u64 curr_cycles;
 	u64 last_cyc_update_time;
 	unsigned long avg_cap;
+
+	/*
+	 * Per-cluster default boost frequencies, derived in sugov_start() from
+	 * this policy's maximum.  They stand in while the matching tunable is 0
+	 * and auto_boost is on.
+	 */
+	unsigned int def_hispeed_freq;
+	unsigned int def_rtg_boost_freq;
 
 	/* Last decision, exposed through the read-only walt/decision node */
 	u64 last_time;
@@ -305,6 +319,15 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 #define WALT_DEFAULT_TARGET_LOAD_THRESH	1024
 #define WALT_DEFAULT_TARGET_LOAD_SHIFT	4
 
+/*
+ * Per-cluster defaults for the two frequency boosts, in %% of the policy's
+ * maximum.  They are used while the matching tunable is 0 and auto_boost is
+ * on: with both tunables at 0 and every cluster identical there would be
+ * nothing WALT-specific left in the governor's behaviour.
+ */
+#define WALT_DEFAULT_HISPEED_PCT	80
+#define WALT_DEFAULT_RTG_BOOST_PCT	70
+
 static unsigned long walt_freq_to_util(struct sugov_policy *sg_policy,
 				       unsigned int freq)
 {
@@ -359,6 +382,13 @@ static void walt_calc_avg_cap(struct sugov_policy *sg_policy, u64 curr_ws,
 		sg_policy->last_ws = curr_ws;
 		sg_policy->curr_cycles = 0;
 		sg_policy->last_cyc_update_time = curr_ws;
+		/*
+		 * The window sequence restarted, so the accumulated average belongs
+		 * to a different timeline: drop it instead of letting is_hiload()
+		 * compare against a stale capacity indefinitely.  avg_cap == 0 also
+		 * suppresses the hispeed boost until a full window is known.
+		 */
+		sg_policy->avg_cap = 0;
 		return;
 	}
 
@@ -378,6 +408,31 @@ static void walt_calc_avg_cap(struct sugov_policy *sg_policy, u64 curr_ws,
 }
 
 /*
+ * Effective hispeed / rtg_boost frequency: the tunable when it is set,
+ * otherwise the per-cluster default while auto_boost is on.  0 means the boost
+ * is disabled.
+ */
+static unsigned int walt_hispeed_freq(struct sugov_policy *sg_policy)
+{
+	unsigned int freq = sg_policy->tunables->hispeed_freq;
+
+	if (!freq && sg_policy->tunables->auto_boost)
+		freq = sg_policy->def_hispeed_freq;
+
+	return freq;
+}
+
+static unsigned int walt_rtg_boost_freq(struct sugov_policy *sg_policy)
+{
+	unsigned int freq = sg_policy->tunables->rtg_boost_freq;
+
+	if (!freq && sg_policy->tunables->auto_boost)
+		freq = sg_policy->def_rtg_boost_freq;
+
+	return freq;
+}
+
+/*
  * Mirrors waltgov_walt_adjust() of the original governor: apply the RTG
  * boost, the hispeed boost, the new task load (nl) fast ramp and the
  * predictive load (pl) of WALT.
@@ -392,23 +447,35 @@ static void walt_adjust_util(struct sugov_cpu *sg_cpu, unsigned long cpu_util,
 	bool is_migration = sg_cpu->flags & WALT_CPUFREQ_IC_MIGRATION;
 	bool is_hiload;
 
-	if (sg_cpu->walt_load.rtgb_active && tunables->rtg_boost_freq) {
-		unsigned long rtgb = walt_target_util(sg_policy,
-						tunables->rtg_boost_freq);
+	if (sg_cpu->walt_load.rtgb_active) {
+		unsigned int rtf = walt_rtg_boost_freq(sg_policy);
 
-		*util = max(*util, rtgb);
+		if (rtf) {
+			unsigned long rtgb = walt_target_util(sg_policy, rtf);
+
+			*util = max(*util, rtgb);
+		}
 	}
 
-	is_hiload = (cpu_util >= mult_frac(sg_policy->avg_cap,
+	/*
+	 * avg_cap == 0 means no WALT window has been accounted yet (or the
+	 * window sequence just restarted): without it the comparison below would
+	 * be trivially true and every first request would jump to hispeed_freq.
+	 */
+	is_hiload = sg_policy->avg_cap &&
+		    (cpu_util >= mult_frac(sg_policy->avg_cap,
 					   tunables->hispeed_load, 100));
 
-	if (is_hiload && !is_migration && tunables->hispeed_freq) {
-		unsigned long hs = walt_target_util(sg_policy,
-						    tunables->hispeed_freq);
+	if (is_hiload && !is_migration) {
+		unsigned int hsf = walt_hispeed_freq(sg_policy);
 
-		if (hs > *util)
-			sg_policy->hispeed_hits++;
-		*util = max(*util, hs);
+		if (hsf) {
+			unsigned long hs = walt_target_util(sg_policy, hsf);
+
+			if (hs > *util)
+				sg_policy->hispeed_hits++;
+			*util = max(*util, hs);
+		}
 	}
 
 	/*
@@ -1004,6 +1071,32 @@ static struct governor_attr target_load_shift = __ATTR_RW(target_load_shift);
 static struct governor_attr pl = __ATTR_RW(pl);
 static struct governor_attr boost = __ATTR_RW(boost);
 
+static ssize_t auto_boost_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+
+	return sprintf(buf, "%d\n", tunables->auto_boost);
+}
+
+static ssize_t auto_boost_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	bool val;
+
+	if (kstrtobool(buf, &val))
+		return -EINVAL;
+	tunables->auto_boost = val;
+
+	return count;
+}
+
+/*
+ * With auto_boost on, hispeed_freq / rtg_boost_freq left at 0 select the
+ * per-cluster default instead of "disabled".
+ */
+static struct governor_attr auto_boost = __ATTR_RW(auto_boost);
+
 static ssize_t decision_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
@@ -1045,6 +1138,7 @@ static struct attribute *sugov_attributes[] = {
 	&rtg_boost_freq.attr,
 	&pl.attr,
 	&boost.attr,
+	&auto_boost.attr,
 	&decision.attr,
 	NULL
 };
@@ -1207,8 +1301,9 @@ static int sugov_init(struct cpufreq_policy *policy)
 	tunables->adaptive_high_freq = 0;
 	tunables->target_load_thresh = WALT_DEFAULT_TARGET_LOAD_THRESH;
 	tunables->target_load_shift = WALT_DEFAULT_TARGET_LOAD_SHIFT;
-	tunables->pl = false;
+	tunables->pl = true;
 	tunables->boost = 0;
+	tunables->auto_boost = true;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
@@ -1278,6 +1373,16 @@ static int sugov_start(struct cpufreq_policy *policy)
 	sg_policy->need_freq_update = false;
 	sg_policy->cached_raw_freq = 0;
 
+	/*
+	 * Per-cluster defaults for the two boosts.  Derived from this policy's
+	 * maximum so that each cluster gets a sensible value, unlike a single
+	 * global tunable which cannot fit all of them.
+	 */
+	sg_policy->def_hispeed_freq =
+		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_HISPEED_PCT, 100);
+	sg_policy->def_rtg_boost_freq =
+		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_RTG_BOOST_PCT, 100);
+
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
 
@@ -1342,3 +1447,10 @@ static int __init waltgov_register(void)
 	return cpufreq_register_governor(&walt_gov);
 }
 fs_initcall(waltgov_register);
+
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_WALT
+struct cpufreq_governor *cpufreq_default_governor(void)
+{
+	return &walt_gov;
+}
+#endif

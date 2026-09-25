@@ -1185,6 +1185,10 @@ static int override_release(char __user *release, size_t len)
 	return ret;
 }
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+extern struct static_key_false susfs_is_uname_spoof_buffer_set;
+extern void susfs_spoof_uname(struct new_utsname* tmp);
+#endif
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
 	struct new_utsname tmp;
@@ -1197,6 +1201,11 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 		strcpy(tmp.release, "5.10.239");
 		pr_debug("fake uname: %s release=%s\n",
 			current->comm, tmp.release);
+	} else {
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+		if (static_branch_likely(&susfs_is_uname_spoof_buffer_set))
+			susfs_spoof_uname(&tmp);
+#endif
 	}
 	up_read(&uts_sem);
 	if (copy_to_user(name, &tmp, sizeof(tmp)))

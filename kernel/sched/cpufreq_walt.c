@@ -409,16 +409,50 @@ static void walt_calc_avg_cap(struct sugov_policy *sg_policy, u64 curr_ws,
 }
 
 /*
+ * ------------------------------------------------------------------
+ * Frame-boost overrides, driven by the fps_boost driver.  See
+ * waltgov_boost_set() further down for the whole interface.
+ * ------------------------------------------------------------------
+ */
+static unsigned int waltgov_boost_hispeed_pct;
+static unsigned int waltgov_boost_rtg_pct;
+
+static unsigned int walt_snap_freq(struct cpufreq_policy *policy,
+				   unsigned int freq);
+
+/*
+ * A frame boost may ask for its own strength, in percent of the cluster
+ * maximum.  It is kept as a percentage rather than a frequency so that every
+ * cluster resolves it against its own maximum, and it is snapped to a real OPP
+ * exactly like the per-cluster defaults are.  0 = "use the default".
+ */
+static unsigned int walt_boost_freq(struct sugov_policy *sg_policy,
+				    unsigned int pct, unsigned int def_freq)
+{
+	if (!pct)
+		return def_freq;
+
+	return walt_snap_freq(sg_policy->policy,
+			      mult_frac(sg_policy->policy->cpuinfo.max_freq,
+					pct, 100));
+}
+
+/*
  * Effective hispeed / rtg_boost frequency: the tunable when it is set,
  * otherwise the per-cluster default while auto_boost is on.  0 means the boost
  * is disabled.
+ *
+ * An explicit tunable always wins, then a frame boost's request, then the
+ * built-in per-cluster default.
  */
 static unsigned int walt_hispeed_freq(struct sugov_policy *sg_policy)
 {
 	unsigned int freq = sg_policy->tunables->hispeed_freq;
 
 	if (!freq && sg_policy->tunables->auto_boost)
-		freq = sg_policy->def_hispeed_freq;
+		freq = walt_boost_freq(sg_policy,
+				       READ_ONCE(waltgov_boost_hispeed_pct),
+				       sg_policy->def_hispeed_freq);
 
 	return freq;
 }
@@ -428,7 +462,9 @@ static unsigned int walt_rtg_boost_freq(struct sugov_policy *sg_policy)
 	unsigned int freq = sg_policy->tunables->rtg_boost_freq;
 
 	if (!freq && sg_policy->tunables->auto_boost)
-		freq = sg_policy->def_rtg_boost_freq;
+		freq = walt_boost_freq(sg_policy,
+				       READ_ONCE(waltgov_boost_rtg_pct),
+				       sg_policy->def_rtg_boost_freq);
 
 	return freq;
 }
@@ -1029,6 +1065,131 @@ int walt_set_up_rate_limit_us(int cpu, unsigned int rate_limit_us)
 	return 0;
 }
 EXPORT_SYMBOL(walt_set_up_rate_limit_us);
+
+/* ------------------------------------------------------------------ */
+/* interface for the fps_boost driver                                  */
+/*                                                                     */
+/* A frame boost is a deliberate, short-lived change of the governor's  */
+/* targets, so the driver is allowed to take hispeed_freq /             */
+/* rtg_boost_freq over while it boosts.  The percentages are relative   */
+/* to each cluster's maximum and are snapped to a real OPP, exactly     */
+/* like the per-cluster defaults in sugov_start(); passing 0 gives the   */
+/* defaults back.  An explicit tunable written through sysfs still wins  */
+/* over both (see walt_hispeed_freq()).                                 */
+/* ------------------------------------------------------------------ */
+int waltgov_boost_set(unsigned int hispeed_pct, unsigned int rtg_pct)
+{
+	struct sugov_policy *sg_policy;
+	int cpus[NR_CPUS];
+	int n = 0, i;
+
+	if (hispeed_pct > 100 || rtg_pct > 100)
+		return -EINVAL;
+
+	WRITE_ONCE(waltgov_boost_hispeed_pct, hispeed_pct);
+	WRITE_ONCE(waltgov_boost_rtg_pct, rtg_pct);
+
+	/*
+	 * Collect one cpu per policy (the targets are per cluster) and poke them
+	 * outside the lock, so the governor's own locks are never taken under
+	 * global_tunables_lock.  The callback may still decline the update
+	 * because of the rate limits; the next WALT update picks it up then, and
+	 * a frame boost is followed by frames.
+	 */
+	mutex_lock(&global_tunables_lock);
+	if (global_tunables) {
+		list_for_each_entry(sg_policy,
+				    &global_tunables->attr_set.policy_list,
+				    tunables_hook) {
+			if (n >= ARRAY_SIZE(cpus))
+				break;
+			if (cpumask_empty(sg_policy->policy->cpus))
+				continue;
+			cpus[n++] = cpumask_first(sg_policy->policy->cpus);
+		}
+	}
+	mutex_unlock(&global_tunables_lock);
+
+	for (i = 0; i < n; i++)
+		waltgov_run_callback(cpu_rq(cpus[i]), WALT_CPUFREQ_BOOST_UPDATE);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(waltgov_boost_set);
+
+/*
+ * Effective boost targets of the cluster @cpu belongs to (kHz) and the
+ * override in use (0 = the built-in default).  Any pointer may be NULL;
+ * a frequency is 0 when the governor is not active on that cluster.
+ */
+void waltgov_boost_freqs(int cpu, unsigned int *hispeed_freq,
+			 unsigned int *rtg_boost_freq, unsigned int *hispeed_pct,
+			 unsigned int *rtg_pct)
+{
+	struct sugov_policy *sg_policy;
+	unsigned int hs = 0, rtg = 0;
+
+	mutex_lock(&global_tunables_lock);
+	if (global_tunables) {
+		list_for_each_entry(sg_policy,
+				    &global_tunables->attr_set.policy_list,
+				    tunables_hook) {
+			if (!cpumask_test_cpu(cpu, sg_policy->policy->cpus))
+				continue;
+			hs = walt_hispeed_freq(sg_policy);
+			rtg = walt_rtg_boost_freq(sg_policy);
+			break;
+		}
+	}
+	mutex_unlock(&global_tunables_lock);
+
+	if (hispeed_freq)
+		*hispeed_freq = hs;
+	if (rtg_boost_freq)
+		*rtg_boost_freq = rtg;
+	if (hispeed_pct)
+		*hispeed_pct = READ_ONCE(waltgov_boost_hispeed_pct);
+	if (rtg_pct)
+		*rtg_pct = READ_ONCE(waltgov_boost_rtg_pct);
+}
+EXPORT_SYMBOL_GPL(waltgov_boost_freqs);
+
+/*
+ * Early detection (walt_early_det_check()) is a second, independent reason for
+ * the governor to ramp.  A driver that boosts by itself can switch it off, so
+ * that the same load is not boosted twice.
+ */
+unsigned int waltgov_early_det_get(void)
+{
+	return READ_ONCE(sysctl_sched_walt_early_det);
+}
+EXPORT_SYMBOL_GPL(waltgov_early_det_get);
+
+int waltgov_early_det_set(unsigned int on)
+{
+	WRITE_ONCE(sysctl_sched_walt_early_det, on ? 1U : 0U);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(waltgov_early_det_set);
+
+unsigned long long waltgov_early_det_hits(void)
+{
+	struct sugov_policy *sg_policy;
+	unsigned long long hits = 0;
+
+	mutex_lock(&global_tunables_lock);
+	if (global_tunables) {
+		list_for_each_entry(sg_policy,
+				    &global_tunables->attr_set.policy_list,
+				    tunables_hook)
+			hits += sg_policy->early_hits;
+	}
+	mutex_unlock(&global_tunables_lock);
+
+	return hits;
+}
+EXPORT_SYMBOL_GPL(waltgov_early_det_hits);
 
 static struct governor_attr up_rate_limit_us = __ATTR_RW(up_rate_limit_us);
 static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);

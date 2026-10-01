@@ -41,6 +41,12 @@ void waltgov_remove_callback(int cpu);
 void waltgov_run_callback(struct rq *rq, unsigned int flags);
 
 /*
+ * Raise WALT_CPUFREQ_EARLY_DET when a task that has been awake for most of a
+ * window is queued on @rq. Called with @rq's lock held, from the tick.
+ */
+void walt_early_det_check(struct rq *rq);
+
+/*
  * Related thread group (RTG) support for the rtg_boost_freq of the walt
  * governor. Same names/prototypes as Qualcomm's API, reduced implementation.
  */
@@ -104,6 +110,7 @@ static inline void waltgov_add_callback(int cpu, struct waltgov_callback *cb,
 				       unsigned int flags)) { }
 static inline void waltgov_remove_callback(int cpu) { }
 static inline void waltgov_run_callback(struct rq *rq, unsigned int flags) { }
+static inline void walt_early_det_check(struct rq *rq) { }
 static inline int sched_set_group_id(struct task_struct *p,
 				     unsigned int group_id) { return -EINVAL; }
 static inline unsigned int sched_get_group_id(struct task_struct *p) { return 0; }

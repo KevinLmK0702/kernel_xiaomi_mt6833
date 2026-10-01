@@ -108,6 +108,7 @@ struct sugov_policy {
 	u64 hispeed_hits;
 	u64 pl_hits;
 	u64 nl_hits;
+	u64 early_hits;
 	unsigned long last_util;
 	unsigned long last_max;
 	unsigned long last_avg_cap;
@@ -433,6 +434,33 @@ static unsigned int walt_rtg_boost_freq(struct sugov_policy *sg_policy)
 }
 
 /*
+ * Snap a frequency to one the cluster can actually run.  The per-cluster
+ * defaults are percentages of cpuinfo.max_freq and usually land between two
+ * OPPs (80%% of 2000 MHz is 1600 MHz, which this SoC's A55 cluster does not
+ * have).  Handing out a frequency that does not exist makes the numbers in
+ * decision/ unreadable and leaves a permanent off-by-one-step in every
+ * comparison against hispeed_freq / rtg_boost_freq.
+ *
+ * Rounding down (RELATION_H) keeps the default at or below the intended
+ * percentage, i.e. 80%% of 2000 MHz becomes 1500 MHz and 80%% of 2203 MHz
+ * becomes 1719 MHz.
+ */
+static unsigned int walt_snap_freq(struct cpufreq_policy *policy,
+				   unsigned int freq)
+{
+	int idx;
+
+	if (!policy->freq_table)
+		return freq;
+
+	idx = cpufreq_frequency_table_target(policy, freq, CPUFREQ_RELATION_H);
+	if (idx < 0)
+		return freq;
+
+	return policy->freq_table[idx].frequency;
+}
+
+/*
  * Mirrors waltgov_walt_adjust() of the original governor: apply the RTG
  * boost, the hispeed boost, the new task load (nl) fast ramp and the
  * predictive load (pl) of WALT.
@@ -475,6 +503,30 @@ static void walt_adjust_util(struct sugov_cpu *sg_cpu, unsigned long cpu_util,
 			if (hs > *util)
 				sg_policy->hispeed_hits++;
 			*util = max(*util, hs);
+		}
+	}
+
+	/*
+	 * Early detection: a task that has been awake for most of a window is very
+	 * likely a sustained load, so ramp now instead of waiting for the demand to
+	 * land in the next window. The producer (walt_early_det_check()) is a port
+	 * of Qualcomm's is_ed_task_present(); their governor's exact response is
+	 * not present in the trees we could check, so this uses the same answer as
+	 * the hiload path - hispeed_freq - which matches the documented intent.
+	 *
+	 * Deliberately independent of avg_cap and is_migration: the point is to act
+	 * before any window has been completed.
+	 */
+	if (sg_cpu->flags & WALT_CPUFREQ_EARLY_DET) {
+		unsigned int hsf = walt_hispeed_freq(sg_policy);
+
+		if (hsf) {
+			unsigned long hs = walt_target_util(sg_policy, hsf);
+
+			if (hs > *util) {
+				sg_policy->early_hits++;
+				*util = max(*util, hs);
+			}
 		}
 	}
 
@@ -1105,7 +1157,7 @@ static ssize_t decision_show(struct gov_attr_set *attr_set, char *buf)
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		len += sprintf(buf + len,
-			"policy%u cpu=%u util=%lu max=%lu avg_cap=%lu pl=%lu nl=%lu rtgb=%d raw_freq=%u freq=%u flags=0x%x updates=%llu hispeed_hits=%llu pl_hits=%llu nl_hits=%llu\n",
+			"policy%u cpu=%u util=%lu max=%lu avg_cap=%lu pl=%lu nl=%lu rtgb=%d raw_freq=%u freq=%u flags=0x%x updates=%llu hispeed_hits=%llu pl_hits=%llu nl_hits=%llu early_hits=%llu def_hs=%u def_rtg=%u\n",
 				sg_policy->policy->cpu, sg_policy->last_cpu,
 				sg_policy->last_util, sg_policy->last_max,
 				sg_policy->last_avg_cap, sg_policy->last_pl,
@@ -1115,7 +1167,10 @@ static ssize_t decision_show(struct gov_attr_set *attr_set, char *buf)
 				(unsigned long long)sg_policy->update_count,
 				(unsigned long long)sg_policy->hispeed_hits,
 				(unsigned long long)sg_policy->pl_hits,
-				(unsigned long long)sg_policy->nl_hits);
+				(unsigned long long)sg_policy->nl_hits,
+				(unsigned long long)sg_policy->early_hits,
+				sg_policy->def_hispeed_freq,
+				sg_policy->def_rtg_boost_freq);
 	}
 
 	return len;
@@ -1376,12 +1431,13 @@ static int sugov_start(struct cpufreq_policy *policy)
 	/*
 	 * Per-cluster defaults for the two boosts.  Derived from this policy's
 	 * maximum so that each cluster gets a sensible value, unlike a single
-	 * global tunable which cannot fit all of them.
+	 * global tunable which cannot fit all of them, and snapped to a real
+	 * OPP of this cluster.
 	 */
-	sg_policy->def_hispeed_freq =
-		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_HISPEED_PCT, 100);
-	sg_policy->def_rtg_boost_freq =
-		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_RTG_BOOST_PCT, 100);
+	sg_policy->def_hispeed_freq = walt_snap_freq(policy,
+		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_HISPEED_PCT, 100));
+	sg_policy->def_rtg_boost_freq = walt_snap_freq(policy,
+		mult_frac(policy->cpuinfo.max_freq, WALT_DEFAULT_RTG_BOOST_PCT, 100));
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);

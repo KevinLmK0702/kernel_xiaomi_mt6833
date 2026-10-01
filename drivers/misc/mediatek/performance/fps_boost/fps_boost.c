@@ -80,6 +80,38 @@ extern unsigned int sched_get_group_id(struct task_struct *p);
 
 #define FB_RTG_MAX_ID	19	/* MAX_NUM_CGROUP_COLOC_ID - 1 (walt.c) */
 
+/*
+ * Governor side of the same coupling (kernel/sched/cpufreq_walt.c).  The
+ * prototypes are spelled out here instead of pulling in a sched header: the
+ * values belong to the "walt" governor, and this driver has no business
+ * including kernel/sched internals.
+ */
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_WALT)
+extern int waltgov_boost_set(unsigned int hispeed_pct, unsigned int rtg_pct);
+extern void waltgov_boost_freqs(int cpu, unsigned int *hispeed_freq,
+				unsigned int *rtg_boost_freq,
+				unsigned int *hispeed_pct,
+				unsigned int *rtg_pct);
+extern unsigned int waltgov_early_det_get(void);
+extern int waltgov_early_det_set(unsigned int on);
+extern unsigned long long waltgov_early_det_hits(void);
+#else
+static inline int waltgov_boost_set(unsigned int hispeed_pct,
+				    unsigned int rtg_pct) { return -ENODEV; }
+static inline void waltgov_boost_freqs(int cpu, unsigned int *hispeed_freq,
+				       unsigned int *rtg_boost_freq,
+				       unsigned int *hispeed_pct,
+				       unsigned int *rtg_pct) { }
+static inline unsigned int waltgov_early_det_get(void) { return 1; }
+static inline int waltgov_early_det_set(unsigned int on) { return -ENODEV; }
+static inline unsigned long long waltgov_early_det_hits(void) { return 0; }
+#endif
+
+/* Early detection value we took over from the governor; -1 = untouched */
+static int  fb_ed_saved = -1;
+/* Boost percentage currently handed to the governor, 0 = defaults */
+static unsigned int fb_walt_pct;
+
 /* ------------------------------------------------------------------ */
 /* tunables (all exposed under /proc/fps_boost/)                       */
 static int  fb_enable;
@@ -353,6 +385,42 @@ static void fb_present_notify(void)
 static unsigned int fb_saved_min[NR_CPUS];
 static unsigned int fb_boost_floor[NR_CPUS];
 
+/*
+ * Snap a percentage of the cluster maximum to a frequency the cluster can
+ * really run.  boost_pct is a *floor* percentage, so pick the lowest OPP at or
+ * above the request (and the highest one when there is none): that is exactly
+ * what the cpufreq core does when it enforces the minimum, so the value we
+ * hand to user_policy.min becomes an honest OPP instead of an intermediate
+ * number.
+ *
+ * The table is walked by hand because cpufreq_table_find_index_l()/h() clamp
+ * the target into [policy->min, policy->max] first, and policy->min is our own
+ * floor from the previous cycle - a lowered floor would be pinned to the old,
+ * higher value.
+ */
+static unsigned int fb_snap_freq(struct cpufreq_policy *pol, unsigned int freq)
+{
+	struct cpufreq_frequency_table *pos;
+	unsigned int above = 0, below = 0;
+
+	if (!pol->freq_table)
+		return freq;
+
+	cpufreq_for_each_valid_entry(pos, pol->freq_table) {
+		if (pos->frequency >= freq) {
+			if (!above || pos->frequency < above)
+				above = pos->frequency;
+		} else if (pos->frequency > below) {
+			below = pos->frequency;
+		}
+	}
+
+	if (above)
+		return above;
+
+	return below ? below : freq;
+}
+
 static int fb_apply_policy(struct cpufreq_policy *pol, bool on,
 			   unsigned int pct)
 {
@@ -370,6 +438,7 @@ static int fb_apply_policy(struct cpufreq_policy *pol, bool on,
 
 	if (on) {
 		want = pol->cpuinfo.max_freq * min(pct, 100U) / 100;
+		want = fb_snap_freq(pol, want);
 		if (want > pol->cpuinfo.max_freq)
 			want = pol->cpuinfo.max_freq;
 
@@ -529,6 +598,56 @@ static void fb_apply_rtg(bool boosting)
 	put_task_struct(task);
 }
 
+/*
+ * Hand the boost strength to the "walt" governor: it turns the percentage into
+ * hispeed_freq / rtg_boost_freq of every cluster (snapped to a real OPP on the
+ * governor side, which knows each policy's maximum), so the renderer's load is
+ * served through the governor's own utilisation path and not only through our
+ * cpufreq floor.  With 0 the per-cluster defaults take over again.
+ *
+ * Only called when the value actually changes: each set re-evaluates both
+ * policies, and the control loop runs every sample_ms.
+ */
+static void fb_sync_walt(bool on, unsigned int pct)
+{
+	if (on) {
+		if (pct > 100)
+			pct = 100;
+		if (fb_walt_pct == pct)
+			return;
+		if (!waltgov_boost_set(pct, pct))
+			fb_walt_pct = pct;
+		return;
+	}
+
+	if (!fb_walt_pct)
+		return;
+	if (!waltgov_boost_set(0, 0))
+		fb_walt_pct = 0;
+}
+
+/*
+ * Early detection makes the governor ramp on its own as soon as a task has
+ * been awake for most of a window - the very state a slow renderer is in.  With
+ * fps_boost enabled that would mean two mechanisms raising the same cluster for
+ * the same reason, so take it over while enabled and hand it back on release.
+ */
+static void fb_walt_early_det(bool enable)
+{
+	if (enable) {
+		if (fb_ed_saved < 0) {
+			fb_ed_saved = (int)waltgov_early_det_get();
+			waltgov_early_det_set(0);
+		}
+		return;
+	}
+
+	if (fb_ed_saved >= 0) {
+		waltgov_early_det_set((unsigned int)fb_ed_saved);
+		fb_ed_saved = -1;
+	}
+}
+
 /* ------------------------------------------------------------------ */
 /* actuators (workqueue context only, never under fb_lock)             */
 static void fb_apply_actuator(bool on, unsigned int pct)
@@ -561,6 +680,9 @@ static void fb_apply_actuator(bool on, unsigned int pct)
 
 	/* keep the WALT group membership in sync with the boost state */
 	fb_apply_rtg(on);
+
+	/* and let the governor boost to our strength while we boost */
+	fb_sync_walt(on, pct);
 }
 
 /* ------------------------------------------------------------------ */
@@ -689,6 +811,38 @@ static int fb_status_show(struct seq_file *m, void *v)
 			cpufreq_cpu_put(pol);
 		}
 	}
+
+	/*
+	 * WALT side of the coupling: what the governor would boost to right now.
+	 * While we boost it follows boost_pct, otherwise the per-cluster default;
+	 * an explicit hispeed_freq / rtg_boost_freq written through sysfs wins
+	 * over both.  early_det is the value that is in effect (we hold it at 0
+	 * while enabled).
+	 */
+	{
+		struct cpufreq_policy *pol;
+		unsigned int cpu, hs, rtg, hs_pct = 0, rtg_pct = 0;
+
+		for_each_possible_cpu(cpu) {
+			pol = cpufreq_cpu_get(cpu);
+			if (!pol)
+				continue;
+			if (pol->cpu == cpu) {
+				hs = rtg = 0;
+				waltgov_boost_freqs(cpu, &hs, &rtg, &hs_pct,
+						    &rtg_pct);
+				seq_printf(m,
+					   "waltpolicy%u : hispeed=%u rtg_boost=%u\n",
+					   cpu, hs, rtg);
+			}
+			cpufreq_cpu_put(pol);
+		}
+		seq_printf(m, "walt_boost  : hispeed_pct=%u rtg_pct=%u\n",
+			   hs_pct, rtg_pct);
+	}
+	seq_printf(m, "early_det   : %u\n", waltgov_early_det_get());
+	seq_printf(m, "early_hits  : %llu\n",
+		   (unsigned long long)waltgov_early_det_hits());
 	return 0;
 }
 
@@ -801,6 +955,7 @@ static ssize_t fb_node_write(struct file *file, const char __user *ubuf,
 	mutex_lock(&fb_lock);
 	if (p == &fb_enable) {
 		fb_enable = val ? 1 : 0;
+		fb_walt_early_det(fb_enable);
 	} else if (p == &fb_target_fps) {
 		fb_target_fps = clamp_val(val, 1, 300);
 		/* a plain single target supersedes the list */
@@ -937,6 +1092,7 @@ static void __exit fb_exit(void)
 		mtk_drm_present_fp = fb_prev_drm_fp;
 	fb_enable = 0;
 	fb_boosting = false;
+	fb_walt_early_det(false);
 	mutex_unlock(&fb_lock);
 
 	fb_apply_actuator(false, (unsigned int)fb_boost_pct);

@@ -47,6 +47,18 @@ static __read_mostly unsigned int walt_io_is_busy = 0;
 
 unsigned int sysctl_sched_walt_init_task_load_pct = 15;
 
+/*
+ * Early detection (port of Qualcomm's is_ed_task_present()): a CFS task that
+ * has been awake for most of a WALT window has not finished within the time a
+ * short task would have, so it is very likely a sustained load. Ask the
+ * governor for hispeed_freq right away instead of waiting for the demand to
+ * show up in the next window.
+ *
+ * 1 = enabled; write 0 to /proc/sys/kernel/sched_walt_early_det to disable.
+ */
+unsigned int sysctl_sched_walt_early_det = 1;
+#define EARLY_DETECTION_DURATION	9500000		/* ns, ~half of a 20ms window */
+
 /* true -> use PELT based load stats, false -> use window-based load stats */
 bool __read_mostly walt_disabled = false;
 
@@ -434,6 +446,59 @@ void waltgov_run_callback(struct rq *rq, unsigned int flags)
 	if (cb)
 		cb->func(cb, walt_ktime_clock(), flags);
 	rcu_read_unlock_sched();
+}
+
+/*
+ * Early detection (ported from Qualcomm's is_ed_task()/is_ed_task_present()).
+ *
+ * A CFS task that woke up at least EARLY_DETECTION_DURATION ago and is still
+ * queued has not finished within the time a short task would have, which makes
+ * it very likely to be a sustained load. The tick raises
+ * WALT_CPUFREQ_EARLY_DET for its CPU, and the "walt" governor answers with
+ * hispeed_freq - roughly half a window earlier than the demand would show up
+ * on its own.
+ *
+ * Qualcomm's version also caches the task in walt_rq->ed_task and re-evaluates
+ * it when it dequeues; this port runs the check on every tick instead, so that
+ * bookkeeping (and the stale pointer it can leave behind) is not needed. The
+ * walk is bounded to 10 tasks, like the original.
+ */
+static inline bool is_ed_task(struct task_struct *p, u64 wallclock)
+{
+	return (wallclock - p->ravg.last_wake_ts) >= EARLY_DETECTION_DURATION;
+}
+
+static bool is_ed_task_present(struct rq *rq, u64 wallclock)
+{
+	struct task_struct *p;
+	int loop_max = 10;
+
+	if (!rq->cfs.h_nr_running)
+		return false;
+
+	list_for_each_entry(p, &rq->cfs_tasks, se.group_node) {
+		if (!loop_max)
+			break;
+		loop_max--;
+
+		/* never woken since boot: no timestamp to measure against */
+		if (!p->ravg.last_wake_ts)
+			continue;
+
+		if (is_ed_task(p, wallclock))
+			return true;
+	}
+
+	return false;
+}
+
+void walt_early_det_check(struct rq *rq)
+{
+	if (unlikely(walt_disabled || !sysctl_sched_walt_early_det))
+		return;
+
+	if (is_ed_task_present(rq, walt_ktime_clock()))
+		waltgov_run_callback(rq, WALT_CPUFREQ_EARLY_DET);
 }
 
 /*
@@ -1379,6 +1444,13 @@ void walt_update_task_ravg(struct task_struct *p, struct rq *rq,
 	if (rq->window_start != window_start)
 		flags |= WALT_CPUFREQ_ROLLOVER;
 
+	/*
+	 * Remember when the task last became runnable: the early detection check
+	 * in the tick measures how long ago that was.
+	 */
+	if (event == TASK_WAKE)
+		p->ravg.last_wake_ts = wallclock;
+
 	if (!p->ravg.mark_start)
 		goto done;
 
@@ -1428,6 +1500,7 @@ void walt_mark_task_starting(struct task_struct *p)
 
 	wallclock = walt_ktime_clock();
 	p->ravg.mark_start = wallclock;
+	p->ravg.last_wake_ts = wallclock;
 }
 
 void walt_set_window_start(struct rq *rq, struct rq_flags *rf)

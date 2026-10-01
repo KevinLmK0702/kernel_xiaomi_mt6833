@@ -590,6 +590,13 @@ struct ravg {
 	u32 grp_id;
 	u32 curr_window, prev_window;
 	u16 active_windows;
+
+	/*
+	 * Wallclock of the last wakeup (0 = never woken since boot). Used by
+	 * WALT's early detection: how long a task has been awake tells a
+	 * sustained load from a task that is about to finish.
+	 */
+	u64 last_wake_ts;
 };
 #endif
 

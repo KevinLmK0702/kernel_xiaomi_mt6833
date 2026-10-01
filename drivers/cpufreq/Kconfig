@@ -124,7 +124,10 @@ config CPU_FREQ_DEFAULT_GOV_WALT
 	bool "walt"
 	depends on SMP
 	depends on SCHED_WALT
-	depends on CPU_FREQ_GOV_SCHEDUTIL
+	# Selected, not depended on: a choice entry must not depend on a symbol
+	# that a sibling entry selects, or kconfig reports a recursive dependency
+	# (the schedutil entry selects CPU_FREQ_GOV_SCHEDUTIL as well).
+	select CPU_FREQ_GOV_SCHEDUTIL
 	select CPU_FREQ_GOV_WALT
 	select CPU_FREQ_GOV_PERFORMANCE
 	help
@@ -132,9 +135,9 @@ config CPU_FREQ_DEFAULT_GOV_WALT
 	  Qualcomm's WALT governor: the frequency decision comes from WALT's
 	  window assisted load tracking (hispeed, related-thread-group and
 	  predictive-load boosts) instead of pure per-CPU utilization. It is
-	  built on the schedutil framework, so CPU_FREQ_GOV_SCHEDUTIL must stay
-	  enabled. If unsure, have a look at the help section of that governor.
-	  The fallback governor will be 'performance'.
+	  built on the schedutil framework, whose governor is therefore
+	  selected automatically. If unsure, have a look at the help section of
+	  that governor. The fallback governor will be 'performance'.
 
 endchoice
 

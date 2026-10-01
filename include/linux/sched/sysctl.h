@@ -29,6 +29,7 @@ extern unsigned int sysctl_sched_use_walt_cpu_util;
 extern unsigned int sysctl_sched_use_walt_task_util;
 extern unsigned int sysctl_sched_walt_init_task_load_pct;
 extern unsigned int sysctl_sched_walt_cpu_high_irqload;
+extern unsigned int sysctl_sched_walt_early_det;
 #endif
 #ifdef CONFIG_MTK_SCHED_BOOST
 extern unsigned int sysctl_sched_isolation_hint_enable;

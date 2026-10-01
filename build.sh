@@ -75,8 +75,26 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     ls -lh "out/arch/arm64/boot/Image.gz"
     file "out/arch/arm64/boot/Image.gz"
 
-    git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-    cp out/arch/arm64/boot/Image AnyKernel3/
+    ZIP_KP="Mix-Kernel-ReSukiSU-v4.2.0-SUSFS-v2.3.0-KPN-EXP-$DATE_STR.zip"
+    ZIP_VANILLA="Mix-Kernel-ReSukiSU-v4.2.0-SUSFS-v2.3.0-Vanilla-$DATE_STR.zip"
+
+    rm -f "$ZIP_KP" "$ZIP_VANILLA"
+
+    print_info "修补 KPatch-Next-EXP..."
+
+    wget -O kpimg https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.14/kpimg-linux 
+    wget -O kptools https://github.com/741afb7/KPatch-Next-EXP/releases/download/0.13.14/kptools-linux
+    chmod +x kpimg kptools
+
+    cp out/arch/arm64/boot/Image Image.vanilla
+    ./kptools -p -i out/arch/arm64/boot/Image -k kpimg -o Image.patched 
+
+    print_info "为修补了 KPatch-Next-EXP 内核打包 AnyKernel3 刷机包..."
+    rm -rf AnyKernel3
+    git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3 
+    cp Image.patched AnyKernel3/Image 
+    cmp -s AnyKernel3/Image Image.patched
+
     cd AnyKernel3
 
     sed -i 's/device\.name1=.*/device.name1=evergo/' anykernel.sh
@@ -88,12 +106,31 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
 
-    zip -r "../Mix-Kernel-ReSukiSU-v4.2.0-SUSFS-v2.3.0-$DATE_STR.zip" *
+    zip -r "../$ZIP_KP" * 
 
     cd ..  
-    print_info "内核打包完成, 文件输出: "
-    ls -la Mix-Kernel-* 
 
+    print_info "为没有修补的内核打包 AnyKernel3 刷机包..."
+    rm -rf AnyKernel3
+    git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3 
+    cp Image.vanilla AnyKernel3/Image 
+
+    cd AnyKernel3
+
+    sed -i 's/device\.name1=.*/device.name1=evergo/' anykernel.sh
+    sed -i 's/device\.name2=.*/device.name2=everpal/' anykernel.sh
+    sed -i '/device\.name[3-5]=.*/d' anykernel.sh
+
+    sed -i 's/BLOCK=.*/BLOCK=boot/' anykernel.sh
+    sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
+
+    sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
+
+    zip -r "../$ZIP_VANILLA" * 
+
+    cd ..  
+    
+    ls -la Mix-Kernel-ReSukiSU-v4.2.0-SUSFS-v2.3.0-*.zip
 else
     print_error "内核编译失败!"
     exit 1
